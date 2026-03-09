@@ -14,6 +14,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.*
 import java.net.*
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class ProxyService : Service() {
@@ -24,22 +25,34 @@ class ProxyService : Service() {
         const val NOTIF_ID = 1
         const val PROXY_PORT = 1080
 
-        val TG_DC_IPS = setOf(
-            "149.154.175.50",  "149.154.175.51",  "149.154.175.100",
-            "149.154.167.51",  "149.154.167.91",  "149.154.167.92",
-            "149.154.167.151", "149.154.167.198", "149.154.167.220",
-            "91.108.4.200",    "91.108.56.100",   "91.108.56.150",
-            "91.108.56.180",   "91.108.56.190",   "91.108.8.190",
-            "95.161.76.100",   "149.154.171.5",
+        // Telegram IP ranges (CIDR)
+        // 149.154.160.0/20, 91.108.0.0/16, 91.105.192.0/23, 185.76.151.0/24
+        private val TG_RANGES = listOf(
+            Pair(ipToLong("149.154.160.0"), ipToLong("149.154.175.255")),
+            Pair(ipToLong("91.108.0.0"),    ipToLong("91.108.255.255")),
+            Pair(ipToLong("91.105.192.0"),  ipToLong("91.105.193.255")),
+            Pair(ipToLong("185.76.151.0"),  ipToLong("185.76.151.255")),
         )
 
         val IP_TO_DC = mapOf(
-            "149.154.175.50" to 1, "149.154.175.51" to 1, "149.154.175.100" to 1,
-            "149.154.167.51" to 2, "149.154.167.91" to 2, "149.154.167.92" to 2,
-            "149.154.167.151" to 2,"149.154.167.198" to 2,"149.154.167.220" to 2,
-            "91.108.4.200" to 3,   "91.108.56.100" to 4,  "91.108.56.150" to 4,
-            "91.108.56.180" to 4,  "91.108.56.190" to 4,  "91.108.8.190" to 5,
-            "149.154.171.5" to 5,  "95.161.76.100" to 2,
+            "149.154.175.50" to 1, "149.154.175.51" to 1, "149.154.175.54" to 1,
+            "149.154.167.41" to 2, "149.154.167.50" to 2, "149.154.167.51" to 2,
+            "149.154.167.220" to 2, "149.154.167.151" to 2, "149.154.167.223" to 2,
+            "149.154.175.100" to 3, "149.154.175.101" to 3,
+            "149.154.167.91" to 4, "149.154.167.92" to 4,
+            "149.154.166.120" to 4, "149.154.166.121" to 4,
+            "91.108.56.100" to 5, "91.108.56.101" to 5,
+            "91.108.56.116" to 5, "91.108.56.126" to 5,
+            "91.105.192.100" to 203,
+        )
+
+        // DC -> IP to connect WebSocket to
+        val DC_TARGET_IP = mapOf(
+            1 to "149.154.175.50",
+            2 to "149.154.167.220",
+            3 to "149.154.175.100",
+            4 to "149.154.167.91",
+            5 to "91.108.56.100",
         )
 
         const val ACTION_STATUS = "com.tgwsproxy.STATUS"
@@ -48,6 +61,18 @@ class ProxyService : Service() {
 
         var isRunning = false
         var activeConnections = 0
+
+        fun ipToLong(ip: String): Long {
+            val parts = ip.split(".")
+            return parts.fold(0L) { acc, s -> (acc shl 8) or s.toLong() }
+        }
+
+        fun isTelegramIp(ip: String): Boolean {
+            return try {
+                val n = ipToLong(ip)
+                TG_RANGES.any { (lo, hi) -> n in lo..hi }
+            } catch (e: Exception) { false }
+        }
     }
 
     private var serverJob: Job? = null
@@ -55,9 +80,10 @@ class ProxyService : Service() {
 
     private val okHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
+            .hostnameVerifier { _, _ -> true } // connect by IP, verify SNI manually
             .build()
     }
 
@@ -109,15 +135,18 @@ class ProxyService : Service() {
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
+            // SOCKS5 greeting
             val ver = cin.readByte().toInt() and 0xFF
             if (ver != 5) { client.close(); return@withContext }
             val nmethods = cin.readByte().toInt() and 0xFF
             cin.skipBytes(nmethods)
             cout.write(byteArrayOf(5, 0))
+            cout.flush()
 
-            cin.readByte()
+            // SOCKS5 request
+            cin.readByte() // ver
             val cmd = cin.readByte().toInt() and 0xFF
-            cin.readByte()
+            cin.readByte() // reserved
             val atyp = cin.readByte().toInt() and 0xFF
 
             val destAddr: String
@@ -143,19 +172,51 @@ class ProxyService : Service() {
                 client.close(); return@withContext
             }
 
+            // SOCKS5 success
             cout.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
             cout.flush()
 
-            val isTelegram = destAddr in TG_DC_IPS
-            val dcId = if (isTelegram) (IP_TO_DC[destAddr] ?: 2) else -1
-            Log.d(TAG, "CONNECT $destAddr:$destPort isTg=$isTelegram dc=$dcId")
+            val isTelegram = isTelegramIp(destAddr)
+            Log.d(TAG, "CONNECT $destAddr:$destPort isTg=$isTelegram")
 
-            if (isTelegram) {
-                val wsSuccess = tryWebSocketTunnel(client, cin, cout, dcId)
-                if (!wsSuccess) directTcpRelay(client, cin, cout, destAddr, destPort)
-            } else {
-                directTcpRelay(client, cin, cout, destAddr, destPort)
+            if (!isTelegram) {
+                directTcpRelay(client, cin, cout, destAddr, destPort, null)
+                return@withContext
             }
+
+            // KEY STEP: read 64-byte MTProto init packet first
+            val init = ByteArray(64)
+            try {
+                cin.readFully(init)
+            } catch (e: Exception) {
+                Log.d(TAG, "Client disconnected before init: ${e.message}")
+                return@withContext
+            }
+
+            // Determine DC
+            var dcId = IP_TO_DC[destAddr]
+            if (dcId == null) {
+                // Try to extract from MTProto obfuscation header
+                dcId = extractDcFromInit(init) ?: 2
+            }
+            Log.d(TAG, "DC=$dcId for $destAddr")
+
+            // Try WebSocket domains
+            val domains = listOf("kws${dcId}.web.telegram.org", "kws${dcId}-1.web.telegram.org")
+            val targetIp = DC_TARGET_IP[dcId] ?: destAddr
+
+            var wsSuccess = false
+            for (domain in domains) {
+                Log.d(TAG, "Trying wss://$domain via $targetIp")
+                wsSuccess = tryWebSocketTunnel(client, cin, cout, domain, targetIp, init)
+                if (wsSuccess) break
+            }
+
+            if (!wsSuccess) {
+                Log.d(TAG, "WS failed, TCP fallback to $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+            }
+
         } catch (e: Exception) {
             Log.d(TAG, "Client error: ${e.message}")
         } finally {
@@ -165,75 +226,159 @@ class ProxyService : Service() {
         }
     }
 
-    private fun tryWebSocketTunnel(client: Socket, cin: DataInputStream, cout: OutputStream, dcId: Int): Boolean {
-        val wsHost = "kws${dcId}.web.telegram.org"
-        Log.d(TAG, "Trying WS via $wsHost")
+    /**
+     * Extract DC ID from MTProto obfuscation init packet (64 bytes).
+     * Uses AES-CTR to decrypt bytes 56-64 and read DC id.
+     */
+    private fun extractDcFromInit(data: ByteArray): Int? {
+        if (data.size < 64) return null
+        return try {
+            val key = data.copyOfRange(8, 40)
+            val iv = data.copyOfRange(40, 56)
 
-        val done = java.util.concurrent.CountDownLatch(1)
+            // AES-CTR keystream
+            val cipher = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
+            val keySpec = javax.crypto.spec.SecretKeySpec(key, "AES")
+            val ivSpec = javax.crypto.spec.IvParameterSpec(iv)
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec, ivSpec)
+            val keystream = cipher.update(ByteArray(64))
+
+            // XOR bytes 56-64
+            val plain = ByteArray(8) { i -> (data[56 + i].toInt() xor keystream[56 + i].toInt()).toByte() }
+
+            // Read DC as little-endian short at offset 4
+            val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
+            val dc = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
+            val dcAbs = Math.abs(dc)
+            Log.d(TAG, "Extracted DC=$dcAbs from init")
+            if (dcAbs in 1..1000) dcAbs else null
+        } catch (e: Exception) {
+            Log.d(TAG, "DC extraction failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun tryWebSocketTunnel(
+        client: Socket, cin: DataInputStream, cout: OutputStream,
+        domain: String, targetIp: String, init: ByteArray
+    ): Boolean {
+        val done = CountDownLatch(1)
         var success = false
-        val pipe = PipedInputStream()
+        val pipe = PipedInputStream(65536)
         val pipeOut = PipedOutputStream(pipe)
 
+        // Connect WebSocket to targetIp but with domain as SNI host
         val request = Request.Builder()
-            .url("wss://$wsHost/apiws")
+            .url("wss://$targetIp/apiws")
+            .header("Host", domain)
             .header("Origin", "https://web.telegram.org")
             .header("Sec-WebSocket-Protocol", "binary")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .build()
 
         val wsListener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG, "WS open: $wsHost")
+                Log.i(TAG, "WS open: $domain via $targetIp")
                 success = true
+
+                // Send buffered init packet first (KEY STEP)
+                webSocket.send(init.toByteString())
+
+                // Then relay client -> WS
                 scope.launch {
                     try {
-                        val buf = ByteArray(8192)
+                        val buf = ByteArray(65536)
                         while (true) {
                             val n = cin.read(buf)
                             if (n < 0) break
                             webSocket.send(buf.copyOf(n).toByteString())
                         }
-                    } catch (e: Exception) { Log.d(TAG, "client→ws: ${e.message}") }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "client→ws ended: ${e.message}")
+                    }
                     webSocket.close(1000, null)
                     done.countDown()
                 }
             }
+
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                try { pipeOut.write(bytes.toByteArray()); pipeOut.flush() }
-                catch (e: Exception) { webSocket.close(1000, null) }
+                try {
+                    val b = bytes.toByteArray()
+                    pipeOut.write(b)
+                    pipeOut.flush()
+                } catch (e: Exception) {
+                    webSocket.close(1000, null)
+                }
             }
+
             override fun onMessage(webSocket: WebSocket, text: String) {}
+
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null); runCatching { pipeOut.close() }; done.countDown()
+                webSocket.close(1000, null)
+                runCatching { pipeOut.close() }
+                done.countDown()
             }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                runCatching { pipeOut.close() }; done.countDown()
+                runCatching { pipeOut.close() }
+                done.countDown()
             }
+
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.d(TAG, "WS fail: ${t.message}"); runCatching { pipeOut.close() }; done.countDown()
+                Log.d(TAG, "WS fail $domain: ${t.message} code=${response?.code}")
+                runCatching { pipeOut.close() }
+                done.countDown()
             }
         }
 
         val ws = okHttpClient.newWebSocket(request, wsListener)
+
+        // WS -> client relay
         val relayJob = scope.launch {
             try {
-                val buf = ByteArray(8192)
-                while (true) { val n = pipe.read(buf); if (n < 0) break; cout.write(buf, 0, n); cout.flush() }
-            } catch (e: Exception) { Log.d(TAG, "ws→client: ${e.message}") }
+                val buf = ByteArray(65536)
+                while (true) {
+                    val n = pipe.read(buf)
+                    if (n < 0) break
+                    cout.write(buf, 0, n)
+                    cout.flush()
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "ws→client ended: ${e.message}")
+            }
         }
 
         done.await(3600, TimeUnit.SECONDS)
         relayJob.cancel()
         ws.cancel()
+        runCatching { pipe.close() }
         return success
     }
 
-    private fun directTcpRelay(client: Socket, cin: DataInputStream, cout: OutputStream, destAddr: String, destPort: Int) {
+    private fun directTcpRelay(
+        client: Socket, cin: DataInputStream, cout: OutputStream,
+        destAddr: String, destPort: Int, init: ByteArray?
+    ) {
         try {
+            Log.d(TAG, "Direct TCP to $destAddr:$destPort")
             val remote = Socket(destAddr, destPort)
-            val t1 = scope.launch { try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}; runCatching { remote.close() } }
-            val t2 = scope.launch { try { remote.inputStream.copyTo(cout) } catch (_: Exception) {}; runCatching { client.close() } }
+            // Send buffered init if any
+            if (init != null) {
+                remote.outputStream.write(init)
+                remote.outputStream.flush()
+            }
+            val t1 = scope.launch {
+                try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}
+                runCatching { remote.close() }
+            }
+            val t2 = scope.launch {
+                try { remote.inputStream.copyTo(cout) } catch (_: Exception) {}
+                runCatching { client.close() }
+            }
             runBlocking { t1.join(); t2.cancelAndJoin() }
-        } catch (e: Exception) { Log.d(TAG, "TCP error: ${e.message}") }
+        } catch (e: Exception) {
+            Log.d(TAG, "TCP error: ${e.message}")
+        }
     }
 
     private fun broadcastStatus() {
