@@ -11,7 +11,8 @@
         android:allowBackup="false"
         android:label="TG WS Proxy"
         android:theme="@style/Theme.App"
-        android:icon="@drawable/ic_launcher">
+        android:icon="@drawable/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher_round">
 
         <activity
             android:name=".MainActivity"
