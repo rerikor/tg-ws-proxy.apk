@@ -52,7 +52,7 @@ class MainActivity : ComponentActivity() {
                         connections = intent?.getIntExtra(ProxyService.EXTRA_CONNECTIONS, 0) ?: 0
                     }
                 }
-                registerReceiver(receiver, IntentFilter(ProxyService.ACTION_STATUS))
+                registerReceiver(receiver, IntentFilter(ProxyService.ACTION_STATUS), Context.RECEIVER_NOT_EXPORTED)
                 statusReceiver = receiver
                 onDispose { unregisterReceiver(receiver) }
             }
