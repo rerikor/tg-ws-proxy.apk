@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.App" parent="Theme.Material3.Dark.NoActionBar">
+    <style name="Theme.App" parent="android:Theme.Black.NoTitleBar">
         <item name="android:statusBarColor">#0E0E0E</item>
         <item name="android:navigationBarColor">#0E0E0E</item>
         <item name="android:windowBackground">#0E0E0E</item>
