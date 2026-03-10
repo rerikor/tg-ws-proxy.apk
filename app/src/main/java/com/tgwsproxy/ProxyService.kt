@@ -9,12 +9,12 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.*
 import java.net.*
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class ProxyService : Service() {
@@ -218,104 +218,96 @@ class ProxyService : Service() {
             val plain = ByteArray(8) { i -> (data[56 + i].toInt() xor keystream[56 + i].toInt()).toByte() }
             val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
             val dc = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
-            val dcAbs = Math.abs(dc)
-            if (dcAbs in 1..1000) dcAbs else null
+            if (Math.abs(dc) in 1..1000) Math.abs(dc) else null
         } catch (e: Exception) { null }
     }
 
-    private fun tryWebSocketTunnel(
-    client: Socket, cin: DataInputStream, cout: OutputStream,
-    domain: String, targetIp: String, init: ByteArray
-): Boolean {
-    val done = CountDownLatch(1)
-    var success = false
-    var closed = false
-    val queue = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
-    val POISON = ByteArray(0)
+    private suspend fun tryWebSocketTunnel(
+        client: Socket, cin: DataInputStream, cout: OutputStream,
+        domain: String, targetIp: String, init: ByteArray
+    ): Boolean = withContext(Dispatchers.IO) {
+        val connected = CompletableDeferred<Boolean>()
+        val tunnelDone = CompletableDeferred<Unit>()
+        val channel = Channel<ByteArray>(Channel.UNLIMITED)
 
-    fun signalDone() {
-        if (!closed) {
-            closed = true
-            queue.offer(POISON)
-            done.countDown()
+        val dns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> =
+                listOf(InetAddress.getByName(targetIp))
         }
-    }
+        val httpClient = baseOkHttpClient.newBuilder().dns(dns).build()
 
-    val dns = object : Dns {
-        override fun lookup(hostname: String): List<InetAddress> =
-            listOf(InetAddress.getByName(targetIp))
-    }
-    val httpClient = baseOkHttpClient.newBuilder().dns(dns).build()
+        val request = Request.Builder()
+            .url("wss://$domain/apiws")
+            .header("Origin", "https://web.telegram.org")
+            .header("Sec-WebSocket-Protocol", "binary")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .build()
 
-    val request = Request.Builder()
-        .url("wss://$domain/apiws")
-        .header("Origin", "https://web.telegram.org")
-        .header("Sec-WebSocket-Protocol", "binary")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .build()
-
-    val wsListener = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            Log.i(TAG, "WS open: $domain via $targetIp")
-            success = true
-            webSocket.send(init.toByteString())
-            scope.launch(Dispatchers.IO) {
-                try {
-                    val buf = ByteArray(32768)
-                    while (true) {
-                        val n = cin.read(buf)
-                        if (n < 0) break
-                        webSocket.send(buf.copyOf(n).toByteString())
-                    }
-                } catch (e: Exception) {
-                    Log.d(TAG, "c→ws: ${e.message}")
+        val wsListener = object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.i(TAG, "WS open: $domain via $targetIp")
+                connected.complete(true)
+                webSocket.send(init.toByteString())
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val buf = ByteArray(32768)
+                        while (true) {
+                            val n = cin.read(buf)
+                            if (n < 0) break
+                            webSocket.send(buf.copyOf(n).toByteString())
+                        }
+                    } catch (e: Exception) { Log.d(TAG, "c→ws: ${e.message}") }
+                    webSocket.close(1000, null)
+                    channel.close()
+                    tunnelDone.complete(Unit)
                 }
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                channel.trySend(bytes.toByteArray())
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {}
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                signalDone()
+                channel.close()
+                tunnelDone.complete(Unit)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                channel.close()
+                tunnelDone.complete(Unit)
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.d(TAG, "WS fail $domain: ${t.message}")
+                connected.complete(false)
+                channel.close()
+                tunnelDone.complete(Unit)
             }
         }
 
-        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            if (!closed) queue.offer(bytes.toByteArray())
-        }
+        val ws = httpClient.newWebSocket(request, wsListener)
 
-        override fun onMessage(webSocket: WebSocket, text: String) {}
+        val success = withTimeoutOrNull(10_000) { connected.await() } ?: false
 
-        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            webSocket.close(1000, null)
-            signalDone()
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            signalDone()
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.d(TAG, "WS fail $domain: ${t.message}")
-            signalDone()
-        }
-    }
-
-    val ws = httpClient.newWebSocket(request, wsListener)
-
-    val relayJob = scope.launch(Dispatchers.IO) {
-        try {
-            while (true) {
-                val chunk = queue.take()
-                if (chunk === POISON || chunk.isEmpty()) break
-                cout.write(chunk)
-                cout.flush()
+        if (success) {
+            val relayJob = launch(Dispatchers.IO) {
+                try {
+                    for (chunk in channel) {
+                        cout.write(chunk)
+                        cout.flush()
+                    }
+                } catch (e: Exception) { Log.d(TAG, "ws→c: ${e.message}") }
             }
-        } catch (e: Exception) {
-            Log.d(TAG, "ws→c: ${e.message}")
+            tunnelDone.await()
+            relayJob.cancelAndJoin()
         }
-    }
 
-    done.await(3600, TimeUnit.SECONDS)
-    relayJob.cancel()
-    ws.cancel()
-    return success
-}
+        ws.cancel()
+        success
+    }
 
     private fun directTcpRelay(
         client: Socket, cin: DataInputStream, cout: OutputStream,
