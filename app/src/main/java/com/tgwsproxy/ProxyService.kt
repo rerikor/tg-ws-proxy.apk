@@ -128,7 +128,7 @@ class ProxyService : Service() {
         broadcastStatus()
         try {
             // No soTimeout — Telegram keeps connections open during media transfers
-            val cin = DataInputStream(BufferedInputStream(client.getInputStream(), 65536))
+            val cin = DataInputStream(client.getInputStream())
             val cout = BufferedOutputStream(client.getOutputStream(), 65536)
 
             val ver = cin.readByte().toInt() and 0xFF
