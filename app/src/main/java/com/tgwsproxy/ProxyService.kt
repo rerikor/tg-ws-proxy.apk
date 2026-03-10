@@ -101,7 +101,7 @@ class ProxyService : Service() {
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
                 if (proto in validProtos) {
                     val dc = Math.abs(dcSigned)
-                    if (dc in 1..1000) return Pair(dc, dcSigned < 0)
+                    if (dc in 1..5) return Pair(dc, dcSigned < 0)
                 }
                 null
             } catch (e: Exception) {
@@ -248,10 +248,8 @@ class ProxyService : Service() {
 
             // Определяем DC из init пакета (включая isMedia)
             val initResult = dcFromInit(init)
-val (dcId, isMedia) = if (initResult != null && initResult.first in 1..5) {
-    initResult
-} else {
-    if (initResult != null) Log.w(TAG, "dcFromInit gave invalid DC=${initResult.first} for $destAddr, using IP fallback")
+val (dcId, isMedia) = initResult ?: run {
+    Log.d(TAG, "dcFromInit null for $destAddr, using IP fallback")
     Pair(getDcForIp(destAddr), false)
 }
             Log.d(TAG, "DC=$dcId isMedia=$isMedia for $destAddr")
