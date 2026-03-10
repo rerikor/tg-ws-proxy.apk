@@ -188,6 +188,7 @@ class ProxyService : Service() {
 
             var wsSuccess = false
             for (domain in domains) {
+                Log.d(TAG, "Trying wss://$domain (ip=$targetIp)")
                 wsSuccess = tryWebSocketTunnel(client, cin, cout, domain, targetIp, init)
                 if (wsSuccess) break
             }
@@ -209,14 +210,15 @@ class ProxyService : Service() {
             val key = data.copyOfRange(8, 40)
             val iv = data.copyOfRange(40, 56)
             val cipher = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE,
-                javax.crypto.spec.SecretKeySpec(key, "AES"),
-                javax.crypto.spec.IvParameterSpec(iv))
-            val ks = cipher.update(ByteArray(64))
-            val plain = ByteArray(8) { i -> (data[56+i].toInt() xor ks[56+i].toInt()).toByte() }
+            val keySpec = javax.crypto.spec.SecretKeySpec(key, "AES")
+            val ivSpec = javax.crypto.spec.IvParameterSpec(iv)
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec, ivSpec)
+            val keystream = cipher.update(ByteArray(64))
+            val plain = ByteArray(8) { i -> (data[56 + i].toInt() xor keystream[56 + i].toInt()).toByte() }
             val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
-            val dc = Math.abs(if (dcRaw > 32767) dcRaw - 65536 else dcRaw)
-            if (dc in 1..1000) dc else null
+            val dc = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
+            val dcAbs = Math.abs(dc)
+            if (dcAbs in 1..1000) dcAbs else null
         } catch (e: Exception) { null }
     }
 
@@ -229,8 +231,10 @@ class ProxyService : Service() {
         val pipe = PipedInputStream(65536)
         val pipeOut = PipedOutputStream(pipe)
 
-        // DNS override: resolve domain to targetIp directly, bypassing РКН DNS
-        val dns = Dns { _ -> listOf(InetAddress.getByName(targetIp)) }
+        val dns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> =
+                listOf(InetAddress.getByName(targetIp))
+        }
         val httpClient = baseOkHttpClient.newBuilder().dns(dns).build()
 
         val request = Request.Builder()
@@ -244,7 +248,7 @@ class ProxyService : Service() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.i(TAG, "WS open: $domain via $targetIp")
                 success = true
-                webSocket.send(init.toByteString()) // send init first!
+                webSocket.send(init.toByteString())
                 scope.launch {
                     try {
                         val buf = ByteArray(65536)
@@ -270,7 +274,7 @@ class ProxyService : Service() {
                 runCatching { pipeOut.close() }; done.countDown()
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.d(TAG, "WS fail $domain: ${t.message}")
+                Log.d(TAG, "WS fail $domain: ${t.message} code=${response?.code}")
                 runCatching { pipeOut.close() }; done.countDown()
             }
         }
@@ -279,7 +283,12 @@ class ProxyService : Service() {
         val relayJob = scope.launch {
             try {
                 val buf = ByteArray(65536)
-                while (true) { val n = pipe.read(buf); if (n < 0) break; cout.write(buf, 0, n); cout.flush() }
+                while (true) {
+                    val n = pipe.read(buf)
+                    if (n < 0) break
+                    cout.write(buf, 0, n)
+                    cout.flush()
+                }
             } catch (e: Exception) { Log.d(TAG, "ws→c: ${e.message}") }
         }
 
@@ -297,15 +306,22 @@ class ProxyService : Service() {
         try {
             val remote = Socket(destAddr, destPort)
             if (init != null) { remote.outputStream.write(init); remote.outputStream.flush() }
-            val t1 = scope.launch { try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}; runCatching { remote.close() } }
-            val t2 = scope.launch { try { remote.inputStream.copyTo(cout) } catch (_: Exception) {}; runCatching { client.close() } }
+            val t1 = scope.launch {
+                try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}
+                runCatching { remote.close() }
+            }
+            val t2 = scope.launch {
+                try { remote.inputStream.copyTo(cout) } catch (_: Exception) {}
+                runCatching { client.close() }
+            }
             runBlocking { t1.join(); t2.cancelAndJoin() }
         } catch (e: Exception) { Log.d(TAG, "TCP: ${e.message}") }
     }
 
     private fun broadcastStatus() {
         sendBroadcast(Intent(ACTION_STATUS).apply {
-            putExtra(EXTRA_RUNNING, isRunning); putExtra(EXTRA_CONNECTIONS, activeConnections)
+            putExtra(EXTRA_RUNNING, isRunning)
+            putExtra(EXTRA_CONNECTIONS, activeConnections)
         })
         if (isRunning) {
             val text = if (activeConnections > 0) "Активных соединений: $activeConnections" else "Запущен • порт $PROXY_PORT"
