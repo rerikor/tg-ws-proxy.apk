@@ -247,10 +247,13 @@ class ProxyService : Service() {
             }
 
             // Определяем DC из init пакета (включая isMedia)
-            val (dcId, isMedia) = dcFromInit(init)?.let { it } ?: run {
-                val dc = getDcForIp(destAddr)
-                Pair(dc, false)
-            }
+            val initResult = dcFromInit(init)
+val (dcId, isMedia) = if (initResult != null && initResult.first in 1..5) {
+    initResult
+} else {
+    if (initResult != null) Log.w(TAG, "dcFromInit gave invalid DC=${initResult.first} for $destAddr, using IP fallback")
+    Pair(getDcForIp(destAddr), false)
+}
             Log.d(TAG, "DC=$dcId isMedia=$isMedia for $destAddr")
 
             val domains = wsDomains(dcId, isMedia)
