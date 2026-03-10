@@ -33,12 +33,19 @@ class ProxyService : Service() {
         )
 
         val IP_TO_DC = mapOf(
-            "149.154.175.50" to 1, "149.154.175.51" to 1, "149.154.175.54" to 1,
+            // DC1
+            "149.154.175.50" to 1, "149.154.175.51" to 1,
+            "149.154.175.53" to 1, "149.154.175.54" to 1,
+            // DC2
             "149.154.167.41" to 2, "149.154.167.50" to 2, "149.154.167.51" to 2,
             "149.154.167.220" to 2, "149.154.167.151" to 2, "149.154.167.223" to 2,
+            "149.154.165.111" to 2,
+            // DC3
             "149.154.175.100" to 3, "149.154.175.101" to 3,
+            // DC4
             "149.154.167.91" to 4, "149.154.167.92" to 4,
             "149.154.166.120" to 4, "149.154.166.121" to 4,
+            // DC5
             "91.108.56.100" to 5, "91.108.56.101" to 5,
             "91.108.56.116" to 5, "91.108.56.126" to 5,
         )
@@ -68,6 +75,16 @@ class ProxyService : Service() {
                 val n = ipToLong(ip)
                 TG_RANGES.any { (lo, hi) -> n in lo..hi }
             } catch (e: Exception) { false }
+        }
+
+        fun getDcForIp(ip: String): Int {
+            return IP_TO_DC[ip] ?: when {
+                ip.startsWith("149.154.175.") -> 1
+                ip.startsWith("149.154.167.") || ip.startsWith("149.154.165.") -> 2
+                ip.startsWith("149.154.166.") -> 4
+                ip.startsWith("91.108.56.") -> 5
+                else -> 2
+            }
         }
     }
 
@@ -181,7 +198,7 @@ class ProxyService : Service() {
             try { cin.readFully(init) }
             catch (e: Exception) { Log.d(TAG, "init read failed: ${e.message}"); return@withContext }
 
-            val dcId = IP_TO_DC[destAddr] ?: extractDcFromInit(init) ?: 2
+            val dcId = getDcForIp(destAddr)
             Log.d(TAG, "DC=$dcId for $destAddr")
 
             val domains = listOf("kws${dcId}.web.telegram.org", "kws${dcId}-1.web.telegram.org")
@@ -203,23 +220,6 @@ class ProxyService : Service() {
             broadcastStatus()
             runCatching { client.close() }
         }
-    }
-
-    private fun extractDcFromInit(data: ByteArray): Int? {
-        if (data.size < 64) return null
-        return try {
-            val key = data.copyOfRange(8, 40)
-            val iv = data.copyOfRange(40, 56)
-            val cipher = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
-            val keySpec = javax.crypto.spec.SecretKeySpec(key, "AES")
-            val ivSpec = javax.crypto.spec.IvParameterSpec(iv)
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec, ivSpec)
-            val keystream = cipher.update(ByteArray(64))
-            val plain = ByteArray(8) { i -> (data[56 + i].toInt() xor keystream[56 + i].toInt()).toByte() }
-            val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
-            val dc = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
-            if (Math.abs(dc) in 1..1000) Math.abs(dc) else null
-        } catch (e: Exception) { null }
     }
 
     private suspend fun tryWebSocketTunnel(
