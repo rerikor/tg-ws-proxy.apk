@@ -127,9 +127,9 @@ class ProxyService : Service() {
         activeConnections++
         broadcastStatus()
         try {
-            // No soTimeout — Telegram keeps connections open during media transfers
+            client.soTimeout = 30_000
             val cin = DataInputStream(client.getInputStream())
-            val cout = BufferedOutputStream(client.getOutputStream(), 65536)
+            val cout = client.getOutputStream()
 
             val ver = cin.readByte().toInt() and 0xFF
             if (ver != 5) { client.close(); return@withContext }
@@ -163,7 +163,6 @@ class ProxyService : Service() {
 
             if (cmd != 1) {
                 cout.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
-                cout.flush()
                 client.close(); return@withContext
             }
 
@@ -297,9 +296,8 @@ class ProxyService : Service() {
                 try {
                     for (chunk in channel) {
                         cout.write(chunk)
-                        if (channel.isEmpty) cout.flush()
+                        cout.flush()
                     }
-                    cout.flush()
                 } catch (e: Exception) { Log.d(TAG, "ws→c: ${e.message}") }
             }
             tunnelDone.await()
@@ -316,7 +314,6 @@ class ProxyService : Service() {
     ) {
         try {
             val remote = Socket(destAddr, destPort)
-            remote.tcpNoDelay = true
             if (init != null) { remote.outputStream.write(init); remote.outputStream.flush() }
             val t1 = scope.launch {
                 try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}
