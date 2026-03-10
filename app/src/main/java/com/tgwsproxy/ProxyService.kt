@@ -95,7 +95,7 @@ class ProxyService : Service() {
                             ((plain[1].toInt() and 0xFF) shl 8) or
                             (plain[0].toInt() and 0xFF)
                 val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
-                val dcSigned = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
+                val dcSigned = (dcRaw.toShort()).toInt()
                 Log.d(TAG, "dcFromInit: proto=0x${proto.toString(16)} dcRaw=$dcSigned plain=${plain.take(8).map { it.toInt() and 0xFF }}")
                 // Оригинал проверяет proto: 0xEFEFEFEF, 0xEEEEEEEE, 0xDDDDDDDD
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
