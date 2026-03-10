@@ -194,9 +194,16 @@ class ProxyService : Service() {
                 return@withContext
             }
 
-            val init = ByteArray(64)
-            try { cin.readFully(init) }
-            catch (e: Exception) { Log.d(TAG, "init read failed: ${e.message}"); return@withContext }
+            val init: ByteArray
+            try {
+                val buf = ByteArray(512)
+                client.soTimeout = 5_000
+                val n = cin.read(buf)
+                client.soTimeout = 30_000
+                if (n <= 0) { Log.d(TAG, "init empty"); return@withContext }
+                init = buf.copyOf(n)
+                Log.d(TAG, "init size=$n for $destAddr")
+            } catch (e: Exception) { Log.d(TAG, "init read failed: ${e.message}"); return@withContext }
 
             val dcId = getDcForIp(destAddr)
             Log.d(TAG, "DC=$dcId for $destAddr")
