@@ -228,8 +228,8 @@ class ProxyService : Service() {
     domain: String, targetIp: String, init: ByteArray
 ): Boolean {
     val done = CountDownLatch(1)
-    @Volatile var success = false
-    @Volatile var closed = false
+    var success = false
+    var closed = false
     val queue = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
     val POISON = ByteArray(0)
 
