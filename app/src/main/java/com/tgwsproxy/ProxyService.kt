@@ -78,7 +78,8 @@ class ProxyService : Service() {
         OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(0, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
             .build()
     }
 
@@ -228,8 +229,7 @@ class ProxyService : Service() {
     ): Boolean {
         val done = CountDownLatch(1)
         var success = false
-        val pipe = PipedInputStream(65536)
-        val pipeOut = PipedOutputStream(pipe)
+        val queue = java.util.concurrent.LinkedBlockingQueue<ByteArray?>(512)
 
         val dns = object : Dns {
             override fun lookup(hostname: String): List<InetAddress> =
@@ -249,53 +249,64 @@ class ProxyService : Service() {
                 Log.i(TAG, "WS open: $domain via $targetIp")
                 success = true
                 webSocket.send(init.toByteString())
-                scope.launch {
+                scope.launch(Dispatchers.IO) {
                     try {
-                        val buf = ByteArray(65536)
+                        val buf = ByteArray(32768)
                         while (true) {
                             val n = cin.read(buf)
                             if (n < 0) break
                             webSocket.send(buf.copyOf(n).toByteString())
                         }
-                    } catch (e: Exception) { Log.d(TAG, "c→ws: ${e.message}") }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "c→ws: ${e.message}")
+                    }
                     webSocket.close(1000, null)
+                    queue.put(null)
                     done.countDown()
                 }
             }
+
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                try { pipeOut.write(bytes.toByteArray()); pipeOut.flush() }
-                catch (e: Exception) { webSocket.close(1000, null) }
+                queue.offer(bytes.toByteArray())
             }
+
             override fun onMessage(webSocket: WebSocket, text: String) {}
+
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null); runCatching { pipeOut.close() }; done.countDown()
+                webSocket.close(1000, null)
+                queue.put(null)
+                done.countDown()
             }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                runCatching { pipeOut.close() }; done.countDown()
+                queue.put(null)
+                done.countDown()
             }
+
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.d(TAG, "WS fail $domain: ${t.message} code=${response?.code}")
-                runCatching { pipeOut.close() }; done.countDown()
+                queue.put(null)
+                done.countDown()
             }
         }
 
         val ws = httpClient.newWebSocket(request, wsListener)
-        val relayJob = scope.launch {
+
+        val relayJob = scope.launch(Dispatchers.IO) {
             try {
-                val buf = ByteArray(65536)
                 while (true) {
-                    val n = pipe.read(buf)
-                    if (n < 0) break
-                    cout.write(buf, 0, n)
+                    val chunk = queue.take() ?: break
+                    cout.write(chunk)
                     cout.flush()
                 }
-            } catch (e: Exception) { Log.d(TAG, "ws→c: ${e.message}") }
+            } catch (e: Exception) {
+                Log.d(TAG, "ws→c: ${e.message}")
+            }
         }
 
         done.await(3600, TimeUnit.SECONDS)
         relayJob.cancel()
         ws.cancel()
-        runCatching { pipe.close() }
         return success
     }
 
@@ -315,7 +326,9 @@ class ProxyService : Service() {
                 runCatching { client.close() }
             }
             runBlocking { t1.join(); t2.cancelAndJoin() }
-        } catch (e: Exception) { Log.d(TAG, "TCP: ${e.message}") }
+        } catch (e: Exception) {
+            Log.d(TAG, "TCP error: ${e.message}")
+        }
     }
 
     private fun broadcastStatus() {
