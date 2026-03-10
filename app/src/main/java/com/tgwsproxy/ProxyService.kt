@@ -125,13 +125,24 @@ class ProxyService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val baseOkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(0, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
-    }
+    val trustAll = arrayOf<javax.net.ssl.TrustManager>(
+        object : javax.net.ssl.X509TrustManager {
+            override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+        }
+    )
+    val sslContext = javax.net.ssl.SSLContext.getInstance("TLS")
+    sslContext.init(null, trustAll, java.security.SecureRandom())
+    OkHttpClient.Builder()
+        .sslSocketFactory(sslContext.socketFactory, trustAll[0] as javax.net.ssl.X509TrustManager)
+        .hostnameVerifier { _, _ -> true }
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(0, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .build()
+}
 
     override fun onBind(intent: Intent?): IBinder? = null
 
