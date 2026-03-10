@@ -33,30 +33,20 @@ class ProxyService : Service() {
         )
 
         val IP_TO_DC = mapOf(
-            // DC1
             "149.154.175.50" to 1, "149.154.175.51" to 1,
             "149.154.175.53" to 1, "149.154.175.54" to 1,
-            // DC2
             "149.154.167.41" to 2, "149.154.167.50" to 2, "149.154.167.51" to 2,
             "149.154.167.220" to 2, "149.154.167.151" to 2, "149.154.167.223" to 2,
             "149.154.165.111" to 2,
-            // DC3
             "149.154.175.100" to 3, "149.154.175.101" to 3,
-            // DC4
             "149.154.167.91" to 4, "149.154.167.92" to 4,
             "149.154.166.120" to 4, "149.154.166.121" to 4,
-            // DC5
             "91.108.56.100" to 5, "91.108.56.101" to 5,
             "91.108.56.116" to 5, "91.108.56.126" to 5,
         )
 
-        val DC_TARGET_IP = mapOf(
-            1 to "149.154.175.50",
-            2 to "149.154.167.220",
-            3 to "149.154.175.100",
-            4 to "149.154.167.91",
-            5 to "91.108.56.100",
-        )
+        // Всё туннелируется через DC2 IP — как в оригинале (--dc-ip 4:149.154.167.220)
+        const val TUNNEL_IP = "149.154.167.220"
 
         const val ACTION_STATUS = "com.tgwsproxy.STATUS"
         const val EXTRA_RUNNING = "running"
@@ -84,6 +74,49 @@ class ProxyService : Service() {
                 ip.startsWith("149.154.166.") -> 4
                 ip.startsWith("91.108.56.") -> 5
                 else -> 2
+            }
+        }
+
+        // Извлекает DC и isMedia из 64-байтного MTProto init пакета
+        // Возвращает Pair(dcId, isMedia) или null
+        fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
+            if (data.size < 64) return null
+            return try {
+                val key = data.copyOfRange(8, 40)
+                val iv = data.copyOfRange(40, 56)
+                val cipher = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
+                val keySpec = javax.crypto.spec.SecretKeySpec(key, "AES")
+                val ivSpec = javax.crypto.spec.IvParameterSpec(iv)
+                cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec, ivSpec)
+                val keystream = cipher.update(ByteArray(64))
+                val plain = ByteArray(8) { i -> (data[56 + i].toInt() xor keystream[56 + i].toInt()).toByte() }
+                val proto = ((plain[3].toInt() and 0xFF) shl 24) or
+                            ((plain[2].toInt() and 0xFF) shl 16) or
+                            ((plain[1].toInt() and 0xFF) shl 8) or
+                            (plain[0].toInt() and 0xFF)
+                val dcRaw = (plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)
+                val dcSigned = if (dcRaw > 32767) dcRaw - 65536 else dcRaw
+                Log.d(TAG, "dcFromInit: proto=0x${proto.toString(16)} dcRaw=$dcSigned plain=${plain.take(8).map { it.toInt() and 0xFF }}")
+                // Оригинал проверяет proto: 0xEFEFEFEF, 0xEEEEEEEE, 0xDDDDDDDD
+                val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
+                if (proto in validProtos) {
+                    val dc = Math.abs(dcSigned)
+                    if (dc in 1..1000) return Pair(dc, dcSigned < 0)
+                }
+                null
+            } catch (e: Exception) {
+                Log.d(TAG, "dcFromInit failed: ${e.message}")
+                null
+            }
+        }
+
+        fun wsDomains(dc: Int, isMedia: Boolean): List<String> {
+            val base = if (dc > 5) "telegram.org" else "web.telegram.org"
+            // Медиа: сначала -1, потом обычный (как в оригинале)
+            return if (isMedia) {
+                listOf("kws$dc-1.$base", "kws$dc.$base")
+            } else {
+                listOf("kws$dc.$base", "kws$dc-1.$base")
             }
         }
     }
@@ -194,31 +227,34 @@ class ProxyService : Service() {
                 return@withContext
             }
 
-            val init: ByteArray
-            try {
-                val buf = ByteArray(512)
-                client.soTimeout = 5_000
-                val n = cin.read(buf)
-                client.soTimeout = 30_000
-                if (n <= 0) { Log.d(TAG, "init empty"); return@withContext }
-                init = buf.copyOf(n)
-                Log.d(TAG, "init size=$n for $destAddr")
-            } catch (e: Exception) { Log.d(TAG, "init read failed: ${e.message}"); return@withContext }
+            // Читаем ровно 64 байта — как оригинал
+            val init = ByteArray(64)
+            try { cin.readFully(init) }
+            catch (e: Exception) {
+                Log.d(TAG, "init read failed: ${e.message}")
+                return@withContext
+            }
 
-            val dcId = getDcForIp(destAddr)
-            Log.d(TAG, "DC=$dcId for $destAddr")
+            // Определяем DC из init пакета (включая isMedia)
+            val (dcId, isMedia) = dcFromInit(init)?.let { it } ?: run {
+                val dc = getDcForIp(destAddr)
+                Pair(dc, false)
+            }
+            Log.d(TAG, "DC=$dcId isMedia=$isMedia for $destAddr")
 
-            val domains = listOf("kws${dcId}.web.telegram.org", "kws${dcId}-1.web.telegram.org")
-            val targetIp = DC_TARGET_IP[dcId] ?: destAddr
+            val domains = wsDomains(dcId, isMedia)
 
             var wsSuccess = false
             for (domain in domains) {
-                Log.d(TAG, "Trying wss://$domain (ip=$targetIp)")
-                wsSuccess = tryWebSocketTunnel(client, cin, cout, domain, targetIp, init)
+                Log.d(TAG, "Trying wss://$domain (ip=$TUNNEL_IP)")
+                wsSuccess = tryWebSocketTunnel(client, cin, cout, domain, TUNNEL_IP, init)
                 if (wsSuccess) break
             }
 
-            if (!wsSuccess) directTcpRelay(client, cin, cout, destAddr, destPort, init)
+            if (!wsSuccess) {
+                Log.w(TAG, "WS failed for DC$dcId, falling back to TCP $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+            }
 
         } catch (e: Exception) {
             Log.d(TAG, "Client error: ${e.message}")
