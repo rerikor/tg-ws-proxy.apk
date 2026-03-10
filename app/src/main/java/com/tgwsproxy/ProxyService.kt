@@ -230,7 +230,7 @@ class ProxyService : Service() {
         val pipeOut = PipedOutputStream(pipe)
 
         // DNS override: resolve domain to targetIp directly, bypassing РКН DNS
-        val dns = Dns { listOf(InetAddress.getByName(targetIp)) }
+        val dns = Dns { _ -> listOf(InetAddress.getByName(targetIp)) }
         val httpClient = baseOkHttpClient.newBuilder().dns(dns).build()
 
         val request = Request.Builder()
