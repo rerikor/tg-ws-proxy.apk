@@ -491,12 +491,6 @@ class ProxyService : Service() {
                 rawDc = initResult.first
                 isMedia = initResult.second
                 Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
-            } else if (initResult != null && destAddr.contains(':')) {
-                // Для IPv6 Android Telegram IP→DC/media может быть неявным, поэтому
-                // разрешаем использовать dcFromInit при валидном результате.
-                rawDc = initResult.first
-                isMedia = initResult.second
-                Log.d(TAG, "dcFromInit accepted for IPv6: DC$rawDc isMedia=$isMedia for $destAddr")
             } else {
                 rawDc = ipInfo.first
                 isMedia = ipInfo.second
