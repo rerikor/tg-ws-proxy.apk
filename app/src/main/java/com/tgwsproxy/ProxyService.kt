@@ -220,7 +220,9 @@ class ProxyService : Service() {
     private suspend fun handleClient(client: Socket) = withContext(Dispatchers.IO) {
         activeConnections++; broadcastStatus()
         try {
-            client.soTimeout = 30_000
+            // soTimeout только для SOCKS5 handshake и чтения init (64 байт)
+            // После этого снимаем таймаут — иначе idle соединения (медиа) закрываются
+            client.soTimeout = 15_000
             val cin  = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
@@ -279,6 +281,9 @@ class ProxyService : Service() {
                 Log.d(TAG, "init read failed for $destAddr: ${e.message}"); return@withContext
             }
             if (isHttpTransport(init)) { client.close(); return@withContext }
+
+            // Снимаем таймаут — туннель может быть idle долго (особенно медиа)
+            client.soTimeout = 0
 
             // Определяем DC и isMedia:
             // 1. Пробуем dcFromInit (читает из зашифрованного пакета)
