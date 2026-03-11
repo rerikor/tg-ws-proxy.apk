@@ -487,13 +487,16 @@ class ProxyService : Service() {
             val initResult = dcFromInit(init)
             val rawDc: Int
             val isMedia: Boolean
-            val isIpv6Dest = destAddr.contains(':')
-            val initMatchesIp = initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second
-            val shouldUseInitDc = initResult != null && (isIpv6Dest || initMatchesIp)
-            if (shouldUseInitDc) {
-                rawDc = initResult!!.first
+            if (initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second) {
+                rawDc = initResult.first
                 isMedia = initResult.second
                 Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
+            } else if (initResult != null && destAddr.contains(':')) {
+                // Для IPv6 Android Telegram IP→DC/media может быть неявным, поэтому
+                // разрешаем использовать dcFromInit при валидном результате.
+                rawDc = initResult.first
+                isMedia = initResult.second
+                Log.d(TAG, "dcFromInit accepted for IPv6: DC$rawDc isMedia=$isMedia for $destAddr")
             } else {
                 rawDc = ipInfo.first
                 isMedia = ipInfo.second
