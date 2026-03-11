@@ -22,6 +22,10 @@ class ProxyService : Service() {
         const val NOTIF_CHANNEL = "tgwsproxy"
         const val NOTIF_ID = 1
         const val PROXY_PORT = 1080
+        const val OP_BINARY = 0x2
+        const val OP_CLOSE = 0x8
+        const val OP_PING = 0x9
+        const val OP_PONG = 0xA
 
         private val TG_RANGES = listOf(
             Pair(ipToLong("149.154.160.0"), ipToLong("149.154.175.255")),
@@ -141,12 +145,6 @@ class ProxyService : Service() {
     // -------------------------------------------------------------------------
     inner class RawWebSocket(private val input: InputStream, private val output: OutputStream) {
 
-        companion object {
-            const val OP_BINARY      = 0x2
-            const val OP_CLOSE       = 0x8
-            const val OP_PING        = 0x9
-            const val OP_PONG        = 0xA
-        }
 
         private val rng = SecureRandom()
 
