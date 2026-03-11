@@ -22,6 +22,10 @@ class ProxyService : Service() {
         const val NOTIF_CHANNEL = "tgwsproxy"
         const val NOTIF_ID = 1
         const val PROXY_PORT = 1080
+        const val OP_BINARY = 0x2
+        const val OP_CLOSE = 0x8
+        const val OP_PING = 0x9
+        const val OP_PONG = 0xA
 
         private val TG_RANGES = listOf(
             Pair(ipToLong("149.154.160.0"), ipToLong("149.154.175.255")),
@@ -109,7 +113,9 @@ class ProxyService : Service() {
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
                 if (proto in validProtos) {
                     val dc = Math.abs(dcRaw)
-                    if (dc in 1..1000) return Pair(dc, dcRaw < 0)
+                    // На практике корректные DC для этого транспорта обычно 1..5.
+                    // Значения вроде 9515/27628 — шум, их нельзя принимать.
+                    if (dc in 1..5) return Pair(dc, dcRaw < 0)
                 }
                 null
             } catch (e: Exception) { null }
@@ -141,12 +147,6 @@ class ProxyService : Service() {
     // -------------------------------------------------------------------------
     inner class RawWebSocket(private val input: InputStream, private val output: OutputStream) {
 
-        companion object {
-            const val OP_BINARY      = 0x2
-            const val OP_CLOSE       = 0x8
-            const val OP_PING        = 0x9
-            const val OP_PONG        = 0xA
-        }
 
         private val rng = SecureRandom()
 
@@ -158,14 +158,39 @@ class ProxyService : Service() {
         }
 
         // Получить следующий data-фрейм. Ping/Pong/Close обрабатываются внутри.
+        // Поддерживает fragmented WebSocket frames (opcode=0 continuation).
         // Возвращает null при закрытии соединения.
         fun recv(): ByteArray? {
+            var fragmentedOpcode = -1
+            var fragmentedPayload: ByteArrayOutputStream? = null
+
             while (true) {
-                val (opcode, payload) = readFrame()
+                val frame = readFrame()
+                val opcode = frame.first
+                val payload = frame.second
+                val fin = frame.third
+
                 when (opcode) {
-                    OP_BINARY, 0x1 -> return payload
+                    OP_BINARY, 0x1 -> {
+                        if (fin) return payload
+                        fragmentedOpcode = opcode
+                        fragmentedPayload = ByteArrayOutputStream().also { it.write(payload) }
+                    }
+                    0x0 -> {
+                        val acc = fragmentedPayload
+                        if (acc == null) {
+                            // continuation без стартового фрейма — игнорируем
+                        } else {
+                            acc.write(payload)
+                            if (fin) {
+                            val op = fragmentedOpcode
+                            fragmentedOpcode = -1
+                            fragmentedPayload = null
+                                if (op == OP_BINARY || op == 0x1) return acc.toByteArray()
+                            }
+                        }
+                    }
                     OP_CLOSE -> {
-                        // Отвечаем close и выходим
                         runCatching {
                             output.write(buildFrame(OP_CLOSE, if (payload.size >= 2) payload.copyOf(2) else byteArrayOf(), mask = true))
                             output.flush()
@@ -173,7 +198,6 @@ class ProxyService : Service() {
                         return null
                     }
                     OP_PING -> {
-                        // Отвечаем pong — как в Python
                         runCatching {
                             output.write(buildFrame(OP_PONG, payload, mask = true))
                             output.flush()
@@ -209,25 +233,37 @@ class ProxyService : Service() {
             return out.toByteArray()
         }
 
-        private fun readFrame(): Pair<Int, ByteArray> {
+        private fun readFrame(): Triple<Int, ByteArray, Boolean> {
             val b0 = input.read()
             val b1 = input.read()
             if (b0 < 0 || b1 < 0) throw EOFException("WS connection closed")
-            val opcode  = b0 and 0x0F
+
+            val fin = (b0 and 0x80) != 0
+            val opcode = b0 and 0x0F
             val isMasked = (b1 and 0x80) != 0
-            var length  = (b1 and 0x7F).toLong()
+
+            var length = (b1 and 0x7F).toLong()
             if (length == 126L) {
-                length = ((input.read() shl 8) or input.read()).toLong()
+                val x0 = input.read(); val x1 = input.read()
+                if (x0 < 0 || x1 < 0) throw EOFException("Unexpected EOF reading WS frame length")
+                length = ((x0 shl 8) or x1).toLong()
             } else if (length == 127L) {
                 length = 0L
-                repeat(8) { length = (length shl 8) or input.read().toLong() }
+                repeat(8) {
+                    val b = input.read()
+                    if (b < 0) throw EOFException("Unexpected EOF reading WS frame length")
+                    length = (length shl 8) or b.toLong()
+                }
             }
+
+            if (length > Int.MAX_VALUE) throw IOException("WS frame too large: $length")
+
             val maskKey = if (isMasked) ByteArray(4).also { input.readNBytes(it, 0, 4) } else null
             val payload = ByteArray(length.toInt()).also { input.readNBytes(it, 0, it.size) }
             if (maskKey != null) {
                 for (i in payload.indices) payload[i] = (payload[i].toInt() xor maskKey[i and 3].toInt()).toByte()
             }
-            return Pair(opcode, payload)
+            return Triple(opcode, payload, fin)
         }
 
         private fun InputStream.readNBytes(buf: ByteArray, off: Int, len: Int) {
@@ -262,6 +298,8 @@ class ProxyService : Service() {
     private fun wsConnect(targetIp: String, domain: String): RawWebSocket? {
         return try {
             val sock = Socket()
+            sock.tcpNoDelay = true
+            sock.keepAlive = true
             sock.connect(InetSocketAddress(targetIp, 443), 10_000)
             sock.soTimeout = 0 // бесконечный — как в Python
 
@@ -390,7 +428,14 @@ class ProxyService : Service() {
             // Non-Telegram → прямой passthrough
             if (!isTelegramIp(destAddr)) {
                 try {
-                    val remote = withTimeoutOrNull(10_000) { withContext(Dispatchers.IO) { Socket(destAddr, destPort) } }
+                    val remote = withTimeoutOrNull(10_000) {
+                        withContext(Dispatchers.IO) {
+                            Socket(destAddr, destPort).also {
+                                it.tcpNoDelay = true
+                                it.keepAlive = true
+                            }
+                        }
+                    }
                         ?: run { cout.write(socks5Reply(0x05)); cout.flush(); client.close(); return@withContext }
                     cout.write(socks5Reply(0x00)); cout.flush()
                     directBridge(client, cin, cout, remote)
@@ -412,17 +457,24 @@ class ProxyService : Service() {
             // Снимаем таймаут — туннель может быть idle
             client.soTimeout = 0
 
-            // Определяем DC и isMedia
+            // Определяем DC и isMedia.
+            // По логам dcFromInit иногда дает мусорные значения, поэтому baseline берем из IP.
+            val ipInfo = getDcInfoForIp(destAddr)
             val initResult = dcFromInit(init)
             val rawDc: Int
             val isMedia: Boolean
-            if (initResult != null) {
-                rawDc = initResult.first; isMedia = initResult.second
-                Log.d(TAG, "dcFromInit OK: DC$rawDc isMedia=$isMedia for $destAddr")
+            if (initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second) {
+                rawDc = initResult.first
+                isMedia = initResult.second
+                Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
             } else {
-                val info = getDcInfoForIp(destAddr)
-                rawDc = info.first; isMedia = info.second
-                Log.d(TAG, "IP fallback: DC$rawDc isMedia=$isMedia for $destAddr")
+                rawDc = ipInfo.first
+                isMedia = ipInfo.second
+                if (initResult != null) {
+                    Log.d(TAG, "dcFromInit mismatch (init=DC${initResult.first} media=${initResult.second}, ip=DC${ipInfo.first} media=${ipInfo.second}) for $destAddr; using IP")
+                } else {
+                    Log.d(TAG, "IP fallback: DC$rawDc isMedia=$isMedia for $destAddr")
+                }
             }
 
             val dcId     = resolveToSupportedDc(rawDc)
@@ -501,6 +553,8 @@ class ProxyService : Service() {
     ) {
         try {
             val remote = Socket(destAddr, destPort)
+            remote.tcpNoDelay = true
+            remote.keepAlive = true
             if (init != null) { remote.outputStream.write(init); remote.outputStream.flush() }
             val t1 = scope.launch(Dispatchers.IO) {
                 try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}
