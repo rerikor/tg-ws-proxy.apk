@@ -188,6 +188,7 @@ class ProxyService : Service() {
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(0, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
+            .pingInterval(10, TimeUnit.SECONDS)
             .build()
     }
 
@@ -331,9 +332,11 @@ class ProxyService : Service() {
         cin: DataInputStream, cout: OutputStream, client: Socket,
         domain: String, targetIp: String, init: ByteArray
     ): Boolean = withContext(Dispatchers.IO) {
-        val connected  = CompletableDeferred<Boolean>()
-        val tunnelDone = CompletableDeferred<Unit>()
-        val fromWs     = Channel<ByteArray>(Channel.UNLIMITED)
+
+        // connected: true = WS открыт, false = ошибка до открытия
+        val connected = CompletableDeferred<Boolean>()
+        // fromWs: данные от сервера к клиенту
+        val fromWs = Channel<ByteArray>(Channel.UNLIMITED)
 
         val httpClient = baseOkHttpClient.newBuilder()
             .dns(object : Dns {
@@ -351,43 +354,73 @@ class ProxyService : Service() {
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .build()
 
-        val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
+        var wsRef: WebSocket? = null
+
+        val listener = object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, r: Response) {
                 Log.i(TAG, "WS opened: $domain")
-                connected.complete(true)
+                wsRef = ws
                 ws.send(init.toByteString())
-                scope.launch(Dispatchers.IO) {
-                    try {
-                        val buf = ByteArray(65536)
-                        while (true) { val n = cin.read(buf); if (n < 0) break; if (!ws.send(buf.copyOf(n).toByteString())) break }
-                    } catch (_: Exception) {}
-                    runCatching { ws.close(1000, null) }
-                    fromWs.close(); tunnelDone.complete(Unit)
-                }
+                connected.complete(true)
             }
-            override fun onMessage(ws: WebSocket, b: ByteString) { fromWs.trySend(b.toByteArray()) }
+            override fun onMessage(ws: WebSocket, b: ByteString) {
+                fromWs.trySend(b.toByteArray())
+            }
             override fun onMessage(ws: WebSocket, t: String) {}
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                runCatching { ws.close(1000, null) }; fromWs.close(); tunnelDone.complete(Unit)
+                runCatching { ws.close(1000, null) }
+                fromWs.close()
             }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                fromWs.close(); tunnelDone.complete(Unit)
+                fromWs.close()
             }
             override fun onFailure(ws: WebSocket, t: Throwable, r: Response?) {
                 Log.d(TAG, "WS onFailure $domain: ${t.message} code=${r?.code}")
                 if (!connected.isCompleted) connected.complete(false)
-                fromWs.close(); tunnelDone.complete(Unit)
+                fromWs.close()
             }
-        })
+        }
 
-        val success = withTimeoutOrNull(10_000) { connected.await() } ?: false
+        val ws = httpClient.newWebSocket(request, listener)
+
+        val success = withTimeoutOrNull(10_000) { connected.await() } ?: run {
+            Log.d(TAG, "WS connect timeout: $domain")
+            false
+        }
 
         if (success) {
-            val relay = launch(Dispatchers.IO) {
-                try { for (chunk in fromWs) { cout.write(chunk); cout.flush() } } catch (_: Exception) {}
-            }
-            tunnelDone.await(); relay.cancelAndJoin()
+            // Две параллельных корутины: клиент→WS и WS→клиент
+            // Используем coroutineScope чтобы обе отменились при завершении любой
+            try {
+                coroutineScope {
+                    // tcp→ws: читаем от клиента, шлём в WS
+                    val toWsJob = launch(Dispatchers.IO) {
+                        try {
+                            val buf = ByteArray(65536)
+                            while (true) {
+                                val n = cin.read(buf)
+                                if (n < 0) break
+                                if (ws.send(buf.copyOf(n).toByteString()) == false) break
+                            }
+                        } catch (_: Exception) {}
+                        runCatching { ws.close(1000, null) }
+                        fromWs.close()
+                        cancel() // завершаем coroutineScope
+                    }
+                    // ws→tcp: читаем из WS, шлём клиенту
+                    val toTcpJob = launch(Dispatchers.IO) {
+                        try {
+                            for (chunk in fromWs) {
+                                cout.write(chunk)
+                                cout.flush()
+                            }
+                        } catch (_: Exception) {}
+                        cancel() // завершаем coroutineScope
+                    }
+                }
+            } catch (_: Exception) {}
         }
+
         runCatching { ws.cancel() }
         success
     }
