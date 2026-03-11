@@ -34,6 +34,12 @@ class ProxyService : Service() {
             Pair(ipToLong("185.76.151.0"),  ipToLong("185.76.151.255")),
         )
 
+        // Из логов Android Telegram активно использует IPv6-адреса вида
+        // 2001:67c:4e8:f004::a / ::b (иначе уходят в медленный passthrough).
+        private val TG_IPV6_PREFIXES = listOf(
+            "2001:67c:4e8:f004:"
+        )
+
         // IP → (dcId, isMedia)
         private val IP_TO_DC: Map<String, Pair<Int, Boolean>> = mapOf(
             "149.154.175.50"  to Pair(1, false), "149.154.175.51" to Pair(1, false),
@@ -61,10 +67,16 @@ class ProxyService : Service() {
         fun ipToLong(ip: String): Long =
             ip.split(".").fold(0L) { acc, s -> (acc shl 8) or s.toLong() }
 
-        fun isTelegramIp(ip: String): Boolean = try {
-            val n = ipToLong(ip)
-            TG_RANGES.any { (lo, hi) -> n in lo..hi }
-        } catch (_: Exception) { false }
+        fun isTelegramIp(ip: String): Boolean {
+            if (ip.contains(':')) {
+                val normalized = ip.lowercase()
+                return TG_IPV6_PREFIXES.any { normalized.startsWith(it) }
+            }
+            return try {
+                val n = ipToLong(ip)
+                TG_RANGES.any { (lo, hi) -> n in lo..hi }
+            } catch (_: Exception) { false }
+        }
 
         fun isHttpTransport(data: ByteArray): Boolean {
             if (data.size < 5) return false
@@ -75,6 +87,17 @@ class ProxyService : Service() {
 
         fun getDcInfoForIp(ip: String): Pair<Int, Boolean> {
             IP_TO_DC[ip]?.let { return it }
+
+            if (ip.contains(':')) {
+                val normalized = ip.lowercase()
+                if (normalized.startsWith("2001:67c:4e8:f004:")) {
+                    // Для IPv6 Telegram не всегда очевидно media/non-media,
+                    // поэтому используем DC2 как стабильный базовый роут,
+                    // а media уточнится из dcFromInit (если возможно).
+                    return Pair(2, false)
+                }
+            }
+
             val dc = when {
                 ip.startsWith("149.154.175.") -> 1
                 ip.startsWith("149.154.167.") -> 2
@@ -87,9 +110,10 @@ class ProxyService : Service() {
             return Pair(dc, isMedia)
         }
 
-        fun resolveToSupportedDc(dc: Int): Int = when (dc) {
-            1, 3 -> 2;  5 -> 4;  2, 4 -> dc
-            else -> if (dc % 2 == 0) 4 else 2
+        fun resolveToSupportedDc(dc: Int): Int = when {
+            dc in 1..5 -> dc
+            dc > 5 -> dc
+            else -> 2
         }
 
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
