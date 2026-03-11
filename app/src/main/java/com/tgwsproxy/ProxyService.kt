@@ -13,6 +13,7 @@ import java.io.*
 import java.net.*
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.*
 
 class ProxyService : Service() {
@@ -63,6 +64,12 @@ class ProxyService : Service() {
 
         var isRunning = false
         var activeConnections = 0
+
+        private const val WS_FAIL_COOLDOWN_MS = 60_000L
+        private val wsDcBlacklist = ConcurrentHashMap.newKeySet<String>()
+        private val wsDcFailUntil = ConcurrentHashMap<String, Long>()
+
+        fun wsDcKey(dc: Int, isMedia: Boolean): String = "$dc:${if (isMedia) 1 else 0}"
 
         fun ipToLong(ip: String): Long =
             ip.split(".").fold(0L) { acc, s -> (acc shl 8) or s.toLong() }
@@ -316,10 +323,11 @@ class ProxyService : Service() {
         return sb.toString().trim()
     }
 
-        // Устанавливает WS соединение: TCP+TLS к targetIp:443 с SNI=domain, HTTP Upgrade
-    // Возвращает RawWebSocket или null при ошибке
-    // Точный порт Python RawWebSocket.connect()
-    private fun wsConnect(targetIp: String, domain: String): RawWebSocket? {
+        private data class WsConnectResult(val ws: RawWebSocket?, val statusCode: Int)
+
+    // Устанавливает WS соединение: TCP+TLS к targetIp:443 с SNI=domain, HTTP Upgrade
+    // Возвращает RawWebSocket + HTTP status code (если удалось прочитать HTTP-ответ)
+    private fun wsConnect(targetIp: String, domain: String): WsConnectResult {
         return try {
             val sock = Socket()
             sock.tcpNoDelay = true
@@ -364,16 +372,16 @@ class ProxyService : Service() {
             if (statusCode != 101) {
                 Log.w(TAG, "WS handshake failed: $firstLine for $domain")
                 while (true) { val line = readHttpLine(rawIn); if (line.isEmpty()) break }
-                return null
+                return WsConnectResult(null, statusCode)
             }
             // Читаем оставшиеся заголовки до пустой строки
             while (true) { val line = readHttpLine(rawIn); if (line.isEmpty()) break }
 
             Log.i(TAG, "WS connected: $domain via $targetIp")
-            RawWebSocket(rawIn, rawOut)
+            WsConnectResult(RawWebSocket(rawIn, rawOut), 101)
         } catch (e: Exception) {
             Log.d(TAG, "WS connect failed $domain: ${e.message}")
-            null
+            WsConnectResult(null, 0)
         }
     }
 
@@ -506,19 +514,73 @@ class ProxyService : Service() {
             Log.i(TAG, "→ DC$dcId$mediaTag (raw=$rawDc) for $destAddr:$destPort")
 
             // Пробуем WebSocket через RawWebSocket
+            val dcKey = wsDcKey(dcId, isMedia)
+            val now = System.currentTimeMillis()
+            if (wsDcBlacklist.contains(dcKey)) {
+                Log.w(TAG, "WS blacklisted for DC$dcId$mediaTag → TCP $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+                return@withContext
+            }
+            val failUntil = wsDcFailUntil[dcKey] ?: 0L
+            if (now < failUntil) {
+                val left = (failUntil - now) / 1000
+                Log.d(TAG, "WS cooldown for DC$dcId$mediaTag (${left}s left) → TCP $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+                return@withContext
+            }
+
             val domains = wsDomains(dcId, isMedia)
             var wsOk = false
+            var sawRedirect = false
+            var allRedirects = true
             for (domain in domains) {
                 Log.d(TAG, "  trying wss://$domain via $TUNNEL_IP")
-                val ws = wsConnect(TUNNEL_IP, domain)
+                val result = wsConnect(TUNNEL_IP, domain)
+                val ws = result.ws
                 if (ws != null) {
                     wsOk = true
+                    wsDcFailUntil.remove(dcKey)
                     bridgeWs(cin, cout, ws, init, domain)
                     break
+                }
+                if (result.statusCode in 300..399) {
+                    sawRedirect = true
+                } else {
+                    allRedirects = false
+                }
+            }
+
+            // Если этот DC отдаёт редиректы (302), пробуем стабильный fallback-DC через WS,
+            // чтобы не скатываться сразу в медленный прямой TCP.
+            if (!wsOk && sawRedirect) {
+                val fallbackDc = when (dcId) {
+                    1, 3 -> 2
+                    5 -> 4
+                    else -> dcId
+                }
+                if (fallbackDc != dcId) {
+                    val fallbackDomains = wsDomains(fallbackDc, isMedia)
+                    for (domain in fallbackDomains) {
+                        Log.d(TAG, "  redirect-fallback trying wss://$domain via $TUNNEL_IP")
+                        val result = wsConnect(TUNNEL_IP, domain)
+                        val ws = result.ws
+                        if (ws != null) {
+                            wsOk = true
+                            wsDcFailUntil.remove(dcKey)
+                            Log.i(TAG, "WS redirect-fallback DC$dcId -> DC$fallbackDc via $domain")
+                            bridgeWs(cin, cout, ws, init, domain)
+                            break
+                        }
+                    }
                 }
             }
 
             if (!wsOk) {
+                if (sawRedirect && allRedirects) {
+                    wsDcBlacklist.add(dcKey)
+                    Log.w(TAG, "WS blacklisting DC$dcId$mediaTag after redirects")
+                }
+                wsDcFailUntil[dcKey] = System.currentTimeMillis() + WS_FAIL_COOLDOWN_MS
                 Log.w(TAG, "WS failed DC$dcId$mediaTag → TCP $destAddr:$destPort")
                 directTcpRelay(client, cin, cout, destAddr, destPort, init)
             }
