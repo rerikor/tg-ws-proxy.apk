@@ -488,10 +488,12 @@ class ProxyService : Service() {
             val rawDc: Int
             val isMedia: Boolean
             val isIpv6Dest = destAddr.contains(':')
-            if (initResult != null && (isIpv6Dest || (initResult.first == ipInfo.first && initResult.second == ipInfo.second))) {
-                rawDc = initResult.first
+            val initMatchesIp = initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second
+            val shouldUseInitDc = initResult != null && (isIpv6Dest || initMatchesIp)
+            if (shouldUseInitDc) {
+                rawDc = initResult!!.first
                 isMedia = initResult.second
-                Log.d(TAG, "dcFromInit accepted: DC$rawDc isMedia=$isMedia for $destAddr")
+                Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
             } else {
                 rawDc = ipInfo.first
                 isMedia = ipInfo.second
