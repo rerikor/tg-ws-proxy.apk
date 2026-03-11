@@ -38,8 +38,7 @@ class ProxyService : Service() {
         // Из логов Android Telegram активно использует IPv6-адреса вида
         // 2001:67c:4e8:f004::a / ::b (иначе уходят в медленный passthrough).
         private val TG_IPV6_PREFIXES = listOf(
-            "2001:67c:4e8:f004:",
-            "2001:67c:4e8:f002:"
+            "2001:67c:4e8:f004:"
         )
 
         // IP → (dcId, isMedia)
