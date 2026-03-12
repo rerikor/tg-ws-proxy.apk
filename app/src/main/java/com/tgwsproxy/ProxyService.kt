@@ -14,7 +14,6 @@ import java.io.*
 import java.net.*
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
-import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.*
 
@@ -40,7 +39,6 @@ class ProxyService : Service() {
         // Из логов Android Telegram активно использует IPv6-адреса вида
         // 2001:67c:4e8:f004::a / ::b (иначе уходят в медленный passthrough).
         private val TG_IPV6_PREFIXES = listOf(
-            "2001:67c:4e8:f002:",
             "2001:67c:4e8:f004:"
         )
 
@@ -71,7 +69,6 @@ class ProxyService : Service() {
         private const val WS_FAIL_COOLDOWN_MS = 60_000L
         private val wsDcBlacklist = ConcurrentHashMap.newKeySet<String>()
         private val wsDcFailUntil = ConcurrentHashMap<String, Long>()
-        private val wsDcPreferred = ConcurrentHashMap<String, Int>()
 
         fun wsDcKey(dc: Int, isMedia: Boolean): String = "$dc:${if (isMedia) 1 else 0}"
 
@@ -101,7 +98,7 @@ class ProxyService : Service() {
 
             if (ip.contains(':')) {
                 val normalized = ip.lowercase()
-                if (normalized.startsWith("2001:67c:4e8:f002:") || normalized.startsWith("2001:67c:4e8:f004:")) {
+                if (normalized.startsWith("2001:67c:4e8:f004:")) {
                     // Для IPv6 Telegram не всегда очевидно media/non-media,
                     // поэтому используем DC2 как стабильный базовый роут,
                     // а media уточнится из dcFromInit (если возможно).
@@ -123,6 +120,7 @@ class ProxyService : Service() {
 
         fun resolveToSupportedDc(dc: Int): Int = when {
             dc in 1..5 -> dc
+            dc > 5 -> dc
             else -> 2
         }
 
@@ -532,12 +530,7 @@ class ProxyService : Service() {
                 return@withContext
             }
 
-            val preferredDc = wsDcPreferred[dcKey]
-            val domains = if (preferredDc != null && preferredDc != dcId) {
-                wsDomains(preferredDc, isMedia) + wsDomains(dcId, isMedia)
-            } else {
-                wsDomains(dcId, isMedia)
-            }
+            val domains = wsDomains(dcId, isMedia)
             var wsOk = false
             var sawRedirect = false
             var allRedirects = true
@@ -548,7 +541,6 @@ class ProxyService : Service() {
                 if (ws != null) {
                     wsOk = true
                     wsDcFailUntil.remove(dcKey)
-                    wsDcPreferred.remove(dcKey)
                     bridgeWs(cin, cout, ws, init, domain)
                     break
                 }
@@ -576,7 +568,6 @@ class ProxyService : Service() {
                         if (ws != null) {
                             wsOk = true
                             wsDcFailUntil.remove(dcKey)
-                            wsDcPreferred[dcKey] = fallbackDc
                             Log.i(TAG, "WS redirect-fallback DC$dcId -> DC$fallbackDc via $domain")
                             bridgeWs(cin, cout, ws, init, domain)
                             break
@@ -586,7 +577,6 @@ class ProxyService : Service() {
             }
 
             if (!wsOk) {
-                wsDcPreferred.remove(dcKey)
                 if (sawRedirect && allRedirects) {
                     wsDcBlacklist.add(dcKey)
                     Log.w(TAG, "WS blacklisting DC$dcId$mediaTag after redirects")
@@ -603,7 +593,7 @@ class ProxyService : Service() {
             Log.d(TAG, "handleClient socket: ${e.message ?: "closed"}")
         } catch (e: Exception) {
             val msg = e.message ?: "no-message"
-            Log.d(TAG, "handleClient ${e.javaClass.simpleName.lowercase(Locale.US)}: $msg")
+            Log.d(TAG, "handleClient ${e.javaClass.simpleName.lowercase()}: $msg")
         } finally {
             activeConnections--; broadcastStatus(); runCatching { client.close() }
         }
