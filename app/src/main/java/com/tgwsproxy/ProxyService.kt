@@ -585,9 +585,15 @@ class ProxyService : Service() {
                 Log.w(TAG, "WS failed DC$dcId$mediaTag → TCP $destAddr:$destPort")
                 directTcpRelay(client, cin, cout, destAddr, destPort, init)
             }
-
+        } catch (e: CancellationException) {
+            Log.d(TAG, "handleClient cancelled")
+        } catch (e: EOFException) {
+            Log.d(TAG, "handleClient EOF: ${e.message ?: "closed"}")
+        } catch (e: SocketException) {
+            Log.d(TAG, "handleClient socket: ${e.message ?: "closed"}")
         } catch (e: Exception) {
-            Log.d(TAG, "handleClient error: ${e.message}")
+            val msg = e.message ?: "no-message"
+            Log.d(TAG, "handleClient ${e.javaClass.simpleName.lowercase()}: $msg")
         } finally {
             activeConnections--; broadcastStatus(); runCatching { client.close() }
         }
