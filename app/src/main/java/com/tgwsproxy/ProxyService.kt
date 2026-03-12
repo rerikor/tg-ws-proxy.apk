@@ -9,10 +9,12 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.selects.select
 import java.io.*
 import java.net.*
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.*
 
 class ProxyService : Service() {
@@ -22,12 +24,22 @@ class ProxyService : Service() {
         const val NOTIF_CHANNEL = "tgwsproxy"
         const val NOTIF_ID = 1
         const val PROXY_PORT = 1080
+        const val OP_BINARY = 0x2
+        const val OP_CLOSE = 0x8
+        const val OP_PING = 0x9
+        const val OP_PONG = 0xA
 
         private val TG_RANGES = listOf(
             Pair(ipToLong("149.154.160.0"), ipToLong("149.154.175.255")),
             Pair(ipToLong("91.108.0.0"),    ipToLong("91.108.255.255")),
             Pair(ipToLong("91.105.192.0"),  ipToLong("91.105.193.255")),
             Pair(ipToLong("185.76.151.0"),  ipToLong("185.76.151.255")),
+        )
+
+        // Из логов Android Telegram активно использует IPv6-адреса вида
+        // 2001:67c:4e8:f004::a / ::b (иначе уходят в медленный passthrough).
+        private val TG_IPV6_PREFIXES = listOf(
+            "2001:67c:4e8:f004:"
         )
 
         // IP → (dcId, isMedia)
@@ -54,13 +66,25 @@ class ProxyService : Service() {
         var isRunning = false
         var activeConnections = 0
 
+        private const val WS_FAIL_COOLDOWN_MS = 60_000L
+        private val wsDcBlacklist = ConcurrentHashMap.newKeySet<String>()
+        private val wsDcFailUntil = ConcurrentHashMap<String, Long>()
+
+        fun wsDcKey(dc: Int, isMedia: Boolean): String = "$dc:${if (isMedia) 1 else 0}"
+
         fun ipToLong(ip: String): Long =
             ip.split(".").fold(0L) { acc, s -> (acc shl 8) or s.toLong() }
 
-        fun isTelegramIp(ip: String): Boolean = try {
-            val n = ipToLong(ip)
-            TG_RANGES.any { (lo, hi) -> n in lo..hi }
-        } catch (_: Exception) { false }
+        fun isTelegramIp(ip: String): Boolean {
+            if (ip.contains(':')) {
+                val normalized = ip.lowercase()
+                return TG_IPV6_PREFIXES.any { normalized.startsWith(it) }
+            }
+            return try {
+                val n = ipToLong(ip)
+                TG_RANGES.any { (lo, hi) -> n in lo..hi }
+            } catch (_: Exception) { false }
+        }
 
         fun isHttpTransport(data: ByteArray): Boolean {
             if (data.size < 5) return false
@@ -71,6 +95,17 @@ class ProxyService : Service() {
 
         fun getDcInfoForIp(ip: String): Pair<Int, Boolean> {
             IP_TO_DC[ip]?.let { return it }
+
+            if (ip.contains(':')) {
+                val normalized = ip.lowercase()
+                if (normalized.startsWith("2001:67c:4e8:f004:")) {
+                    // Для IPv6 Telegram не всегда очевидно media/non-media,
+                    // поэтому используем DC2 как стабильный базовый роут,
+                    // а media уточнится из dcFromInit (если возможно).
+                    return Pair(2, false)
+                }
+            }
+
             val dc = when {
                 ip.startsWith("149.154.175.") -> 1
                 ip.startsWith("149.154.167.") -> 2
@@ -83,9 +118,10 @@ class ProxyService : Service() {
             return Pair(dc, isMedia)
         }
 
-        fun resolveToSupportedDc(dc: Int): Int = when (dc) {
-            1, 3 -> 2;  5 -> 4;  2, 4 -> dc
-            else -> if (dc % 2 == 0) 4 else 2
+        fun resolveToSupportedDc(dc: Int): Int = when {
+            dc in 1..5 -> dc
+            dc > 5 -> dc
+            else -> 2
         }
 
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
@@ -109,7 +145,9 @@ class ProxyService : Service() {
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
                 if (proto in validProtos) {
                     val dc = Math.abs(dcRaw)
-                    if (dc in 1..1000) return Pair(dc, dcRaw < 0)
+                    // На практике корректные DC для этого транспорта обычно 1..5.
+                    // Значения вроде 9515/27628 — шум, их нельзя принимать.
+                    if (dc in 1..5) return Pair(dc, dcRaw < 0)
                 }
                 null
             } catch (e: Exception) { null }
@@ -141,12 +179,6 @@ class ProxyService : Service() {
     // -------------------------------------------------------------------------
     inner class RawWebSocket(private val input: InputStream, private val output: OutputStream) {
 
-        companion object {
-            const val OP_BINARY      = 0x2
-            const val OP_CLOSE       = 0x8
-            const val OP_PING        = 0x9
-            const val OP_PONG        = 0xA
-        }
 
         private val rng = SecureRandom()
 
@@ -158,14 +190,39 @@ class ProxyService : Service() {
         }
 
         // Получить следующий data-фрейм. Ping/Pong/Close обрабатываются внутри.
+        // Поддерживает fragmented WebSocket frames (opcode=0 continuation).
         // Возвращает null при закрытии соединения.
         fun recv(): ByteArray? {
+            var fragmentedOpcode = -1
+            var fragmentedPayload: ByteArrayOutputStream? = null
+
             while (true) {
-                val (opcode, payload) = readFrame()
+                val frame = readFrame()
+                val opcode = frame.first
+                val payload = frame.second
+                val fin = frame.third
+
                 when (opcode) {
-                    OP_BINARY, 0x1 -> return payload
+                    OP_BINARY, 0x1 -> {
+                        if (fin) return payload
+                        fragmentedOpcode = opcode
+                        fragmentedPayload = ByteArrayOutputStream().also { it.write(payload) }
+                    }
+                    0x0 -> {
+                        val acc = fragmentedPayload
+                        if (acc == null) {
+                            // continuation без стартового фрейма — игнорируем
+                        } else {
+                            acc.write(payload)
+                            if (fin) {
+                            val op = fragmentedOpcode
+                            fragmentedOpcode = -1
+                            fragmentedPayload = null
+                                if (op == OP_BINARY || op == 0x1) return acc.toByteArray()
+                            }
+                        }
+                    }
                     OP_CLOSE -> {
-                        // Отвечаем close и выходим
                         runCatching {
                             output.write(buildFrame(OP_CLOSE, if (payload.size >= 2) payload.copyOf(2) else byteArrayOf(), mask = true))
                             output.flush()
@@ -173,7 +230,6 @@ class ProxyService : Service() {
                         return null
                     }
                     OP_PING -> {
-                        // Отвечаем pong — как в Python
                         runCatching {
                             output.write(buildFrame(OP_PONG, payload, mask = true))
                             output.flush()
@@ -209,25 +265,37 @@ class ProxyService : Service() {
             return out.toByteArray()
         }
 
-        private fun readFrame(): Pair<Int, ByteArray> {
+        private fun readFrame(): Triple<Int, ByteArray, Boolean> {
             val b0 = input.read()
             val b1 = input.read()
             if (b0 < 0 || b1 < 0) throw EOFException("WS connection closed")
-            val opcode  = b0 and 0x0F
+
+            val fin = (b0 and 0x80) != 0
+            val opcode = b0 and 0x0F
             val isMasked = (b1 and 0x80) != 0
-            var length  = (b1 and 0x7F).toLong()
+
+            var length = (b1 and 0x7F).toLong()
             if (length == 126L) {
-                length = ((input.read() shl 8) or input.read()).toLong()
+                val x0 = input.read(); val x1 = input.read()
+                if (x0 < 0 || x1 < 0) throw EOFException("Unexpected EOF reading WS frame length")
+                length = ((x0 shl 8) or x1).toLong()
             } else if (length == 127L) {
                 length = 0L
-                repeat(8) { length = (length shl 8) or input.read().toLong() }
+                repeat(8) {
+                    val b = input.read()
+                    if (b < 0) throw EOFException("Unexpected EOF reading WS frame length")
+                    length = (length shl 8) or b.toLong()
+                }
             }
+
+            if (length > Int.MAX_VALUE) throw IOException("WS frame too large: $length")
+
             val maskKey = if (isMasked) ByteArray(4).also { input.readNBytes(it, 0, 4) } else null
             val payload = ByteArray(length.toInt()).also { input.readNBytes(it, 0, it.size) }
             if (maskKey != null) {
                 for (i in payload.indices) payload[i] = (payload[i].toInt() xor maskKey[i and 3].toInt()).toByte()
             }
-            return Pair(opcode, payload)
+            return Triple(opcode, payload, fin)
         }
 
         private fun InputStream.readNBytes(buf: ByteArray, off: Int, len: Int) {
@@ -256,12 +324,15 @@ class ProxyService : Service() {
         return sb.toString().trim()
     }
 
-        // Устанавливает WS соединение: TCP+TLS к targetIp:443 с SNI=domain, HTTP Upgrade
-    // Возвращает RawWebSocket или null при ошибке
-    // Точный порт Python RawWebSocket.connect()
-    private fun wsConnect(targetIp: String, domain: String): RawWebSocket? {
+        private data class WsConnectResult(val ws: RawWebSocket?, val statusCode: Int)
+
+    // Устанавливает WS соединение: TCP+TLS к targetIp:443 с SNI=domain, HTTP Upgrade
+    // Возвращает RawWebSocket + HTTP status code (если удалось прочитать HTTP-ответ)
+    private fun wsConnect(targetIp: String, domain: String): WsConnectResult {
         return try {
             val sock = Socket()
+            sock.tcpNoDelay = true
+            sock.keepAlive = true
             sock.connect(InetSocketAddress(targetIp, 443), 10_000)
             sock.soTimeout = 0 // бесконечный — как в Python
 
@@ -302,16 +373,16 @@ class ProxyService : Service() {
             if (statusCode != 101) {
                 Log.w(TAG, "WS handshake failed: $firstLine for $domain")
                 while (true) { val line = readHttpLine(rawIn); if (line.isEmpty()) break }
-                return null
+                return WsConnectResult(null, statusCode)
             }
             // Читаем оставшиеся заголовки до пустой строки
             while (true) { val line = readHttpLine(rawIn); if (line.isEmpty()) break }
 
             Log.i(TAG, "WS connected: $domain via $targetIp")
-            RawWebSocket(rawIn, rawOut)
+            WsConnectResult(RawWebSocket(rawIn, rawOut), 101)
         } catch (e: Exception) {
             Log.d(TAG, "WS connect failed $domain: ${e.message}")
-            null
+            WsConnectResult(null, 0)
         }
     }
 
@@ -390,7 +461,14 @@ class ProxyService : Service() {
             // Non-Telegram → прямой passthrough
             if (!isTelegramIp(destAddr)) {
                 try {
-                    val remote = withTimeoutOrNull(10_000) { withContext(Dispatchers.IO) { Socket(destAddr, destPort) } }
+                    val remote = withTimeoutOrNull(10_000) {
+                        withContext(Dispatchers.IO) {
+                            Socket(destAddr, destPort).also {
+                                it.tcpNoDelay = true
+                                it.keepAlive = true
+                            }
+                        }
+                    }
                         ?: run { cout.write(socks5Reply(0x05)); cout.flush(); client.close(); return@withContext }
                     cout.write(socks5Reply(0x00)); cout.flush()
                     directBridge(client, cin, cout, remote)
@@ -412,17 +490,24 @@ class ProxyService : Service() {
             // Снимаем таймаут — туннель может быть idle
             client.soTimeout = 0
 
-            // Определяем DC и isMedia
+            // Определяем DC и isMedia.
+            // По логам dcFromInit иногда дает мусорные значения, поэтому baseline берем из IP.
+            val ipInfo = getDcInfoForIp(destAddr)
             val initResult = dcFromInit(init)
             val rawDc: Int
             val isMedia: Boolean
-            if (initResult != null) {
-                rawDc = initResult.first; isMedia = initResult.second
-                Log.d(TAG, "dcFromInit OK: DC$rawDc isMedia=$isMedia for $destAddr")
+            if (initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second) {
+                rawDc = initResult.first
+                isMedia = initResult.second
+                Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
             } else {
-                val info = getDcInfoForIp(destAddr)
-                rawDc = info.first; isMedia = info.second
-                Log.d(TAG, "IP fallback: DC$rawDc isMedia=$isMedia for $destAddr")
+                rawDc = ipInfo.first
+                isMedia = ipInfo.second
+                if (initResult != null) {
+                    Log.d(TAG, "dcFromInit mismatch (init=DC${initResult.first} media=${initResult.second}, ip=DC${ipInfo.first} media=${ipInfo.second}) for $destAddr; using IP")
+                } else {
+                    Log.d(TAG, "IP fallback: DC$rawDc isMedia=$isMedia for $destAddr")
+                }
             }
 
             val dcId     = resolveToSupportedDc(rawDc)
@@ -430,19 +515,73 @@ class ProxyService : Service() {
             Log.i(TAG, "→ DC$dcId$mediaTag (raw=$rawDc) for $destAddr:$destPort")
 
             // Пробуем WebSocket через RawWebSocket
+            val dcKey = wsDcKey(dcId, isMedia)
+            val now = System.currentTimeMillis()
+            if (wsDcBlacklist.contains(dcKey)) {
+                Log.w(TAG, "WS blacklisted for DC$dcId$mediaTag → TCP $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+                return@withContext
+            }
+            val failUntil = wsDcFailUntil[dcKey] ?: 0L
+            if (now < failUntil) {
+                val left = (failUntil - now) / 1000
+                Log.d(TAG, "WS cooldown for DC$dcId$mediaTag (${left}s left) → TCP $destAddr:$destPort")
+                directTcpRelay(client, cin, cout, destAddr, destPort, init)
+                return@withContext
+            }
+
             val domains = wsDomains(dcId, isMedia)
             var wsOk = false
+            var sawRedirect = false
+            var allRedirects = true
             for (domain in domains) {
                 Log.d(TAG, "  trying wss://$domain via $TUNNEL_IP")
-                val ws = wsConnect(TUNNEL_IP, domain)
+                val result = wsConnect(TUNNEL_IP, domain)
+                val ws = result.ws
                 if (ws != null) {
                     wsOk = true
+                    wsDcFailUntil.remove(dcKey)
                     bridgeWs(cin, cout, ws, init, domain)
                     break
+                }
+                if (result.statusCode in 300..399) {
+                    sawRedirect = true
+                } else {
+                    allRedirects = false
+                }
+            }
+
+            // Если этот DC отдаёт редиректы (302), пробуем стабильный fallback-DC через WS,
+            // чтобы не скатываться сразу в медленный прямой TCP.
+            if (!wsOk && sawRedirect) {
+                val fallbackDc = when (dcId) {
+                    1, 3 -> 2
+                    5 -> 4
+                    else -> dcId
+                }
+                if (fallbackDc != dcId) {
+                    val fallbackDomains = wsDomains(fallbackDc, isMedia)
+                    for (domain in fallbackDomains) {
+                        Log.d(TAG, "  redirect-fallback trying wss://$domain via $TUNNEL_IP")
+                        val result = wsConnect(TUNNEL_IP, domain)
+                        val ws = result.ws
+                        if (ws != null) {
+                            wsOk = true
+                            wsDcFailUntil.remove(dcKey)
+                            Log.i(TAG, "WS redirect-fallback DC$dcId -> DC$fallbackDc via $domain")
+                            bridgeWs(cin, cout, ws, init, domain)
+                            break
+                        }
+                    }
                 }
             }
 
             if (!wsOk) {
+                if (sawRedirect && allRedirects) {
+                    wsDcBlacklist.add(dcKey)
+                    Log.w(TAG, "WS blacklisting DC$dcId$mediaTag after redirects")
+                }
+                wsDcFailUntil[dcKey] = System.currentTimeMillis() + WS_FAIL_COOLDOWN_MS
                 Log.w(TAG, "WS failed DC$dcId$mediaTag → TCP $destAddr:$destPort")
                 directTcpRelay(client, cin, cout, destAddr, destPort, init)
             }
@@ -467,8 +606,7 @@ class ProxyService : Service() {
 
         try {
             coroutineScope {
-                // tcp → ws
-                launch(Dispatchers.IO) {
+                val tcpToWs = launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(65536)
                         while (true) {
@@ -476,22 +614,31 @@ class ProxyService : Service() {
                             if (n < 0) break
                             ws.send(buf.copyOf(n))
                         }
-                    } catch (_: Exception) {}
-                    cancel()
+                    } catch (_: Exception) {
+                    }
                 }
-                // ws → tcp
-                launch(Dispatchers.IO) {
+
+                val wsToTcp = launch(Dispatchers.IO) {
                     try {
                         while (true) {
                             val data = ws.recv() ?: break
                             cout.write(data)
                             cout.flush()
                         }
-                    } catch (_: Exception) {}
-                    cancel()
+                    } catch (_: Exception) {
+                    }
                 }
+
+                // Ждем, пока завершится любая сторона моста, затем останавливаем вторую.
+                select<Unit> {
+                    tcpToWs.onJoin { }
+                    wsToTcp.onJoin { }
+                }
+                tcpToWs.cancelAndJoin()
+                wsToTcp.cancelAndJoin()
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         Log.d(TAG, "WS bridge closed: $domain")
     }
 
@@ -501,6 +648,8 @@ class ProxyService : Service() {
     ) {
         try {
             val remote = Socket(destAddr, destPort)
+            remote.tcpNoDelay = true
+            remote.keepAlive = true
             if (init != null) { remote.outputStream.write(init); remote.outputStream.flush() }
             val t1 = scope.launch(Dispatchers.IO) {
                 try { cin.copyTo(remote.outputStream) } catch (_: Exception) {}
