@@ -116,6 +116,7 @@ class ProxyService : Service() {
             val isMedia = ip.startsWith("149.154.165.") || ip.startsWith("149.154.166.")
             return Pair(dc, isMedia)
         }
+
         fun resolveToSupportedDc(dc: Int): Int = when {
             dc in 1..5 -> dc
             dc > 5 -> dc
