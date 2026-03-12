@@ -514,19 +514,6 @@ class ProxyService : Service() {
             val mediaTag = if (isMedia) " media" else ""
             Log.i(TAG, "→ DC$dcId$mediaTag (raw=$rawDc) for $destAddr:$destPort")
 
-            // Пробуем WebSocket через RawWebSocket.
-            // Для DC1/DC3/DC5 сразу используем устойчивые WS-цели, чтобы не тратить
-            // 1-2 лишних RTT на предсказуемые 302 редиректы.
-            val wsDcId = when (dcId) {
-                1, 3 -> 2
-                5 -> 4
-                else -> dcId
-            }
-            if (wsDcId != dcId) {
-                Log.d(TAG, "WS pre-map DC$dcId$mediaTag -> DC$wsDcId")
-            }
-
-            val dcKey = wsDcKey(wsDcId, isMedia)
             val now = System.currentTimeMillis()
             if (wsDcBlacklist.contains(dcKey)) {
                 Log.w(TAG, "WS blacklisted for DC$dcId$mediaTag → TCP $destAddr:$destPort")
@@ -596,6 +583,7 @@ class ProxyService : Service() {
                 Log.w(TAG, "WS failed DC$wsDcId$mediaTag → TCP $destAddr:$destPort")
                 directTcpRelay(client, cin, cout, destAddr, destPort, init)
             }
+            
         } catch (e: CancellationException) {
             Log.d(TAG, "handleClient cancelled")
         } catch (e: EOFException) {
