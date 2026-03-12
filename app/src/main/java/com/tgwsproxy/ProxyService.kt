@@ -68,7 +68,6 @@ class ProxyService : Service() {
         private const val WS_FAIL_COOLDOWN_MS = 60_000L
         private val wsDcBlacklist = ConcurrentHashMap.newKeySet<String>()
         private val wsDcFailUntil = ConcurrentHashMap<String, Long>()
-        private val wsDcPreferred = ConcurrentHashMap<String, Int>()
 
         fun wsDcKey(dc: Int, isMedia: Boolean): String = "$dc:${if (isMedia) 1 else 0}"
 
@@ -117,14 +116,10 @@ class ProxyService : Service() {
             val isMedia = ip.startsWith("149.154.165.") || ip.startsWith("149.154.166.")
             return Pair(dc, isMedia)
         }
-
-        fun resolveToSupportedDc(dc: Int): Int = when (dc) {
-            // Практический роутинг: DC1/DC3 часто дают 302 и в реальности стабильнее через DC2,
-            // а DC5 чаще стабильнее через DC4.
-            1, 3 -> 2
-            5 -> 4
-            2, 4 -> dc
-            else -> if (dc > 5) dc else 2
+        fun resolveToSupportedDc(dc: Int): Int = when {
+            dc in 1..5 -> dc
+            dc > 5 -> dc
+            else -> 2
         }
 
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
@@ -533,11 +528,7 @@ class ProxyService : Service() {
                 return@withContext
             }
 
-            val preferredDc = wsDcPreferred[dcKey] ?: dcId
-            if (preferredDc != dcId) {
-                Log.d(TAG, "using preferred DC$preferredDc for DC$dcId$mediaTag")
-            }
-            val domains = wsDomains(preferredDc, isMedia)
+            val domains = wsDomains(dcId, isMedia)
             var wsOk = false
             var sawRedirect = false
             var allRedirects = true
@@ -548,7 +539,6 @@ class ProxyService : Service() {
                 if (ws != null) {
                     wsOk = true
                     wsDcFailUntil.remove(dcKey)
-                    wsDcPreferred[dcKey] = preferredDc
                     bridgeWs(cin, cout, ws, init, domain)
                     break
                 }
@@ -576,7 +566,6 @@ class ProxyService : Service() {
                         if (ws != null) {
                             wsOk = true
                             wsDcFailUntil.remove(dcKey)
-                            wsDcPreferred[dcKey] = fallbackDc
                             Log.i(TAG, "WS redirect-fallback DC$dcId -> DC$fallbackDc via $domain")
                             bridgeWs(cin, cout, ws, init, domain)
                             break
