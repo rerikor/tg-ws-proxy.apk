@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.selects.select
 import java.io.*
 import java.net.*
 import java.security.SecureRandom
@@ -605,8 +606,7 @@ class ProxyService : Service() {
 
         try {
             coroutineScope {
-                // tcp → ws
-                launch(Dispatchers.IO) {
+                val tcpToWs = launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(65536)
                         while (true) {
@@ -614,22 +614,31 @@ class ProxyService : Service() {
                             if (n < 0) break
                             ws.send(buf.copyOf(n))
                         }
-                    } catch (_: Exception) {}
-                    cancel()
+                    } catch (_: Exception) {
+                    }
                 }
-                // ws → tcp
-                launch(Dispatchers.IO) {
+
+                val wsToTcp = launch(Dispatchers.IO) {
                     try {
                         while (true) {
                             val data = ws.recv() ?: break
                             cout.write(data)
                             cout.flush()
                         }
-                    } catch (_: Exception) {}
-                    cancel()
+                    } catch (_: Exception) {
+                    }
                 }
+
+                // Ждем, пока завершится любая сторона моста, затем останавливаем вторую.
+                select<Unit> {
+                    tcpToWs.onJoin { }
+                    wsToTcp.onJoin { }
+                }
+                tcpToWs.cancelAndJoin()
+                wsToTcp.cancelAndJoin()
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         Log.d(TAG, "WS bridge closed: $domain")
     }
 
