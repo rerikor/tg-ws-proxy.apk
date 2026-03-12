@@ -116,12 +116,10 @@ class ProxyService : Service() {
             val isMedia = ip.startsWith("149.154.165.") || ip.startsWith("149.154.166.")
             return Pair(dc, isMedia)
         }
-        fun resolveToSupportedDc(dc: Int): Int {
-            return when {
-                dc in 1..5 -> dc
-                dc > 5 -> dc
-                else -> 2
-            }
+        fun resolveToSupportedDc(dc: Int): Int = when {
+            dc in 1..5 -> dc
+            dc > 5 -> dc
+            else -> 2
         }
 
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
