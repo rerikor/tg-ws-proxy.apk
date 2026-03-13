@@ -514,6 +514,8 @@ class ProxyService : Service() {
             val mediaTag = if (isMedia) " media" else ""
             Log.i(TAG, "→ DC$dcId$mediaTag (raw=$rawDc) for $destAddr:$destPort")
 
+            // Пробуем WebSocket через RawWebSocket
+            val dcKey = wsDcKey(dcId, isMedia)
             val now = System.currentTimeMillis()
             if (wsDcBlacklist.contains(dcKey)) {
                 Log.w(TAG, "WS blacklisted for DC$dcId$mediaTag → TCP $destAddr:$destPort")
@@ -528,7 +530,7 @@ class ProxyService : Service() {
                 return@withContext
             }
 
-            val domains = wsDomains(wsDcId, isMedia)
+            val domains = wsDomains(dcId, isMedia)
             var wsOk = false
             var sawRedirect = false
             var allRedirects = true
@@ -552,12 +554,12 @@ class ProxyService : Service() {
             // Если этот DC отдаёт редиректы (302), пробуем стабильный fallback-DC через WS,
             // чтобы не скатываться сразу в медленный прямой TCP.
             if (!wsOk && sawRedirect) {
-                val fallbackDc = when (wsDcId) {
+                val fallbackDc = when (dcId) {
                     1, 3 -> 2
                     5 -> 4
-                    else -> wsDcId
+                    else -> dcId
                 }
-                if (fallbackDc != wsDcId) {
+                if (fallbackDc != dcId) {
                     val fallbackDomains = wsDomains(fallbackDc, isMedia)
                     for (domain in fallbackDomains) {
                         Log.d(TAG, "  redirect-fallback trying wss://$domain via $TUNNEL_IP")
@@ -566,7 +568,7 @@ class ProxyService : Service() {
                         if (ws != null) {
                             wsOk = true
                             wsDcFailUntil.remove(dcKey)
-                            Log.i(TAG, "WS redirect-fallback DC$wsDcId -> DC$fallbackDc via $domain")
+                            Log.i(TAG, "WS redirect-fallback DC$dcId -> DC$fallbackDc via $domain")
                             bridgeWs(cin, cout, ws, init, domain)
                             break
                         }
@@ -577,13 +579,12 @@ class ProxyService : Service() {
             if (!wsOk) {
                 if (sawRedirect && allRedirects) {
                     wsDcBlacklist.add(dcKey)
-                    Log.w(TAG, "WS blacklisting DC$wsDcId$mediaTag after redirects")
+                    Log.w(TAG, "WS blacklisting DC$dcId$mediaTag after redirects")
                 }
                 wsDcFailUntil[dcKey] = System.currentTimeMillis() + WS_FAIL_COOLDOWN_MS
-                Log.w(TAG, "WS failed DC$wsDcId$mediaTag → TCP $destAddr:$destPort")
+                Log.w(TAG, "WS failed DC$dcId$mediaTag → TCP $destAddr:$destPort")
                 directTcpRelay(client, cin, cout, destAddr, destPort, init)
             }
-            
         } catch (e: CancellationException) {
             Log.d(TAG, "handleClient cancelled")
         } catch (e: EOFException) {
