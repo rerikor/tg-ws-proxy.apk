@@ -45,7 +45,7 @@ class ProxyService : Service() {
         // IP → (dcId, isMedia)
         private val IP_TO_DC: Map<String, Pair<Int, Boolean>> = mapOf(
             "149.154.175.50"  to Pair(1, false), "149.154.175.51" to Pair(1, false),
-            "149.154.175.54"  to Pair(1, false),
+            "149.154.175.53"  to Pair(1, false), "149.154.175.54"  to Pair(1, false),
             "149.154.167.41"  to Pair(2, false), "149.154.167.50" to Pair(2, false),
             "149.154.167.51"  to Pair(2, false), "149.154.167.220" to Pair(2, false),
             "149.154.167.151" to Pair(2, true),  "149.154.167.223" to Pair(2, true),
@@ -118,10 +118,10 @@ class ProxyService : Service() {
             return Pair(dc, isMedia)
         }
 
-        fun resolveToSupportedDc(dc: Int): Int = when {
-            dc in 1..5 -> dc
-            dc > 5 -> dc
-            else -> 2
+        fun resolveToSupportedDc(dc: Int): Int = when (dc) {
+            1, 3 -> 2
+            5    -> 4
+            else -> dc
         }
 
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
