@@ -5,7 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkRequest
 import android.os.IBinder
 import android.util.Log
 import kotlinx.coroutines.*
@@ -15,6 +19,7 @@ import java.net.*
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.*
 
 class ProxyService : Service() {
@@ -118,12 +123,6 @@ class ProxyService : Service() {
             return Pair(dc, isMedia)
         }
 
-        fun resolveToSupportedDc(dc: Int): Int = when (dc) {
-            1, 3 -> 2
-            5    -> 4
-            else -> dc
-        }
-
         fun dcFromInit(data: ByteArray): Pair<Int, Boolean>? {
             if (data.size < 64) return null
             return try {
@@ -145,9 +144,7 @@ class ProxyService : Service() {
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
                 if (proto in validProtos) {
                     val dc = Math.abs(dcRaw)
-                    // На практике корректные DC для этого транспорта обычно 1..5.
-                    // Значения вроде 9515/27628 — шум, их нельзя принимать.
-                    if (dc in 1..5) return Pair(dc, dcRaw < 0)
+                    if (dc in 1..1000) return Pair(dc, dcRaw < 0)
                 }
                 null
             } catch (e: Exception) { null }
@@ -390,9 +387,17 @@ class ProxyService : Service() {
 
     private var serverJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val openClients = ConcurrentHashMap.newKeySet<Socket>()
+    private val networkRestartScheduled = AtomicBoolean(false)
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
-    override fun onCreate() { super.onCreate(); createNotificationChannel() }
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        registerNetworkCallback()
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, buildNotification("Запущен • порт $PROXY_PORT"))
@@ -402,6 +407,7 @@ class ProxyService : Service() {
 
     override fun onDestroy() {
         stopProxy(); isRunning = false; broadcastStatus(); scope.cancel()
+        unregisterNetworkCallback()
         super.onDestroy()
     }
 
@@ -417,8 +423,40 @@ class ProxyService : Service() {
 
     private fun stopProxy() { serverJob?.cancel() }
 
+    private fun registerNetworkCallback() {
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = scheduleProxyRestart("network available")
+            override fun onLost(network: Network) = scheduleProxyRestart("network lost")
+        }
+        networkCallback = callback
+        runCatching {
+            connectivityManager?.registerNetworkCallback(NetworkRequest.Builder().build(), callback)
+        }.onFailure { Log.w(TAG, "registerNetworkCallback failed: ${it.message}") }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        runCatching { connectivityManager?.unregisterNetworkCallback(cb) }
+        networkCallback = null
+    }
+
+    private fun scheduleProxyRestart(reason: String) {
+        if (!isRunning) return
+        if (!networkRestartScheduled.compareAndSet(false, true)) return
+        scope.launch {
+            Log.i(TAG, "Network changed ($reason), restarting proxy sessions")
+            wsDcFailUntil.clear()
+            wsDcBlacklist.clear()
+            openClients.forEach { runCatching { it.close() } }
+            delay(400)
+            networkRestartScheduled.set(false)
+        }
+    }
+
     private suspend fun handleClient(client: Socket) = withContext(Dispatchers.IO) {
         activeConnections++; broadcastStatus()
+        openClients.add(client)
         try {
             client.soTimeout = 15_000
             val cin  = DataInputStream(client.getInputStream())
@@ -494,25 +532,15 @@ class ProxyService : Service() {
             // По логам dcFromInit иногда дает мусорные значения, поэтому baseline берем из IP.
             val ipInfo = getDcInfoForIp(destAddr)
             val initResult = dcFromInit(init)
-            val rawDc: Int
-            val isMedia: Boolean
-            if (initResult != null && initResult.first == ipInfo.first && initResult.second == ipInfo.second) {
-                rawDc = initResult.first
-                isMedia = initResult.second
-                Log.d(TAG, "dcFromInit confirmed: DC$rawDc isMedia=$isMedia for $destAddr")
+            val dcId = initResult?.first ?: ipInfo.first
+            val isMedia = initResult?.second ?: ipInfo.second
+            if (initResult != null) {
+                Log.d(TAG, "dcFromInit: DC$dcId isMedia=$isMedia for $destAddr")
             } else {
-                rawDc = ipInfo.first
-                isMedia = ipInfo.second
-                if (initResult != null) {
-                    Log.d(TAG, "dcFromInit mismatch (init=DC${initResult.first} media=${initResult.second}, ip=DC${ipInfo.first} media=${ipInfo.second}) for $destAddr; using IP")
-                } else {
-                    Log.d(TAG, "IP fallback: DC$rawDc isMedia=$isMedia for $destAddr")
-                }
+                Log.d(TAG, "IP fallback: DC$dcId isMedia=$isMedia for $destAddr")
             }
-
-            val dcId     = resolveToSupportedDc(rawDc)
             val mediaTag = if (isMedia) " media" else ""
-            Log.i(TAG, "→ DC$dcId$mediaTag (raw=$rawDc) for $destAddr:$destPort")
+            Log.i(TAG, "→ DC$dcId$mediaTag for $destAddr:$destPort")
 
             // Пробуем WebSocket через RawWebSocket
             val dcKey = wsDcKey(dcId, isMedia)
@@ -595,6 +623,7 @@ class ProxyService : Service() {
             val msg = e.message ?: "no-message"
             Log.d(TAG, "handleClient ${e.javaClass.simpleName.lowercase()}: $msg")
         } finally {
+            openClients.remove(client)
             activeConnections--; broadcastStatus(); runCatching { client.close() }
         }
     }
@@ -612,13 +641,19 @@ class ProxyService : Service() {
 
         try {
             coroutineScope {
+                val keepAlive = launch(Dispatchers.IO) {
+                    while (isActive) {
+                        delay(20_000)
+                        runCatching { ws.send(byteArrayOf()) }
+                    }
+                }
                 val tcpToWs = launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(65536)
                         while (true) {
                             val n = cin.read(buf)
                             if (n < 0) break
-                            ws.send(buf.copyOf(n))
+                            ws.send(if (n == buf.size) buf else buf.copyOfRange(0, n))
                         }
                     } catch (_: Exception) {
                     }
@@ -640,6 +675,7 @@ class ProxyService : Service() {
                     tcpToWs.onJoin { }
                     wsToTcp.onJoin { }
                 }
+                keepAlive.cancelAndJoin()
                 tcpToWs.cancelAndJoin()
                 wsToTcp.cancelAndJoin()
             }
