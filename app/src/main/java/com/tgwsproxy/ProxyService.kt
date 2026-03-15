@@ -142,24 +142,35 @@ class ProxyService : Service() {
                 val validProtos = setOf(0xEFEFEFEF.toInt(), 0xEEEEEEEE.toInt(), 0xDDDDDDDD.toInt())
                 if (proto !in validProtos) return null
 
-                val signedDcRaw = ((plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8))
-                    .toShort().toInt()
+                val signedDcRaw = ((plain[4].toInt() and 0xFF) or ((plain[5].toInt() and 0xFF) shl 8)).toShort().toInt()
+                val absSigned = kotlin.math.abs(signedDcRaw)
                 val paddedUnsignedDc = (data[60].toInt() and 0xFF) or ((data[61].toInt() and 0xFF) shl 8)
 
-                val dc: Int
-                val isMedia: Boolean
-                if (proto == 0xDDDDDDDD.toInt()) {
-                    // Для padded intermediate используем <H из [60:62]
-                    dc = paddedUnsignedDc
-                    isMedia = false
-                    Log.d(TAG, "dcFromInit proto=0xdddddddd dc_u16=$dc")
-                } else {
-                    dc = kotlin.math.abs(signedDcRaw)
-                    isMedia = signedDcRaw < 0
-                    Log.d(TAG, "dcFromInit proto=0x${proto.toLong().and(0xFFFFFFFFL).toString(16)} dc_raw=$signedDcRaw")
+                // Ближе к python: media обычно кодируется знаком dc_raw.
+                // Доп. эвристика: некоторые клиенты шлют media как dc+100.
+                val fromSigned = when {
+                    absSigned in 1..5 -> Pair(absSigned, signedDcRaw < 0)
+                    absSigned in 101..105 -> Pair(absSigned - 100, true)
+                    else -> null
                 }
 
-                if (dc in 1..5) Pair(dc, isMedia) else null
+                if (fromSigned != null) {
+                    Log.d(TAG, "dcFromInit proto=0x${proto.toLong().and(0xFFFFFFFFL).toString(16)} dc_raw=$signedDcRaw dc=${fromSigned.first} media=${fromSigned.second}")
+                    return fromSigned
+                }
+
+                if (proto == 0xDDDDDDDD.toInt()) {
+                    val fromPadded = when {
+                        paddedUnsignedDc in 1..5 -> Pair(paddedUnsignedDc, false)
+                        paddedUnsignedDc in 101..105 -> Pair(paddedUnsignedDc - 100, true)
+                        else -> null
+                    }
+                    Log.d(TAG, "dcFromInit proto=0xdddddddd dc_u16=$paddedUnsignedDc parsed=$fromPadded")
+                    return fromPadded
+                }
+
+                Log.d(TAG, "dcFromInit proto=0x${proto.toLong().and(0xFFFFFFFFL).toString(16)} dc_raw=$signedDcRaw ignored")
+                null
             } catch (_: Exception) {
                 null
             }
@@ -403,7 +414,7 @@ class ProxyService : Service() {
     private var serverJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val openClients = ConcurrentHashMap.newKeySet<Socket>()
-    private val dcResolutionCache = ConcurrentHashMap<String, Pair<Int, Boolean>>()
+    private val dcResolutionCache = ConcurrentHashMap<String, Int>()
     private val networkRestartScheduled = AtomicBoolean(false)
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -544,25 +555,34 @@ class ProxyService : Service() {
             // Снимаем таймаут — туннель может быть idle
             client.soTimeout = 0
 
-            // Определяем DC/isMedia: сперва из кэша IP, иначе из init, иначе fallback по IP.
-            val cachedInfo = dcResolutionCache[destAddr]
+            // Определяем DC и isMedia отдельно:
+            // - DC можно кешировать по IP,
+            // - isMedia определяем для каждого соединения (init/ip), не кешируем.
+            val cachedDc = dcResolutionCache[destAddr]
             val ipInfo = getDcInfoForIp(destAddr)
-            val resolvedInfo = if (cachedInfo != null) {
-                Log.d(TAG, "DC cache hit: DC${cachedInfo.first} isMedia=${cachedInfo.second} for $destAddr")
-                cachedInfo
-            } else {
-                val initResult = dcFromInit(init)
-                val picked = initResult ?: ipInfo
-                dcResolutionCache[destAddr] = picked
-                if (initResult != null) {
-                    Log.d(TAG, "dcFromInit: DC${picked.first} isMedia=${picked.second} for $destAddr")
-                } else {
-                    Log.d(TAG, "IP fallback: DC${picked.first} isMedia=${picked.second} for $destAddr")
+            val initResult = dcFromInit(init)
+
+            val dcId = when {
+                initResult != null -> {
+                    dcResolutionCache[destAddr] = initResult.first
+                    initResult.first
                 }
-                picked
+                cachedDc != null -> cachedDc
+                else -> {
+                    dcResolutionCache[destAddr] = ipInfo.first
+                    ipInfo.first
+                }
             }
-            val dcId = resolvedInfo.first
-            val isMedia = resolvedInfo.second
+
+            val isMedia = initResult?.second ?: ipInfo.second
+
+            if (initResult != null) {
+                Log.d(TAG, "dcFromInit: DC${initResult.first} isMedia=${initResult.second} for $destAddr")
+            } else if (cachedDc != null) {
+                Log.d(TAG, "DC cache hit: DC$cachedDc (media by ip/init=$isMedia) for $destAddr")
+            } else {
+                Log.d(TAG, "IP fallback: DC${ipInfo.first} isMedia=${ipInfo.second} for $destAddr")
+            }
             val mediaTag = if (isMedia) " media" else ""
             Log.i(TAG, "→ DC$dcId$mediaTag for $destAddr:$destPort")
 
@@ -648,7 +668,7 @@ class ProxyService : Service() {
             Log.d(TAG, "handleClient ${e.javaClass.simpleName.lowercase()}: $msg")
         } finally {
             openClients.remove(client)
-            activeConnections--; broadcastStatus(); runCatching { client.close() }
+            activeConnections--; broadcastStatus(); closeSocketWithLog(client, "client-final")
         }
     }
 
@@ -673,11 +693,14 @@ class ProxyService : Service() {
                 }
                 val tcpToWs = launch(Dispatchers.IO) {
                     try {
-                        val buf = ByteArray(65536)
+                        val buf = ByteArray(32 * 1024)
+                        var chunks = 0
                         while (true) {
                             val n = cin.read(buf)
                             if (n < 0) break
                             ws.send(if (n == buf.size) buf else buf.copyOfRange(0, n))
+                            chunks++
+                            if (chunks and 0x1F == 0) yield()
                         }
                     } catch (_: Exception) {
                     }
@@ -685,10 +708,13 @@ class ProxyService : Service() {
 
                 val wsToTcp = launch(Dispatchers.IO) {
                     try {
+                        var chunks = 0
                         while (true) {
                             val data = ws.recv() ?: break
                             cout.write(data)
                             cout.flush()
+                            chunks++
+                            if (chunks and 0x1F == 0) yield()
                         }
                     } catch (_: Exception) {
                     }
@@ -708,6 +734,29 @@ class ProxyService : Service() {
         Log.d(TAG, "WS bridge closed: $domain")
     }
 
+    private suspend fun relayWithBackoff(input: InputStream, output: OutputStream) {
+        val buffer = ByteArray(32 * 1024)
+        var chunks = 0
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) break
+            output.write(buffer, 0, n)
+            chunks++
+            if (chunks and 0x1F == 0) {
+                yield()
+                delay(1)
+            }
+        }
+    }
+
+    private fun closeSocketWithLog(socket: Socket, tag: String) {
+        try {
+            socket.close()
+        } catch (e: Exception) {
+            Log.d(TAG, "$tag close error: ${e.message}")
+        }
+    }
+
     private fun directTcpRelay(
         client: Socket, cin: DataInputStream, cout: OutputStream,
         destAddr: String, destPort: Int, init: ByteArray?
@@ -718,12 +767,12 @@ class ProxyService : Service() {
             remote.keepAlive = true
             if (init != null) { remote.outputStream.write(init); remote.outputStream.flush() }
             val t1 = scope.launch(Dispatchers.IO) {
-                try { cin.copyTo(remote.outputStream, bufferSize = 64 * 1024) } catch (_: Exception) {}
-                runCatching { remote.close() }
+                try { relayWithBackoff(cin, remote.outputStream) } catch (_: Exception) {}
+                closeSocketWithLog(remote, "remote")
             }
             val t2 = scope.launch(Dispatchers.IO) {
-                try { remote.inputStream.copyTo(cout, bufferSize = 64 * 1024) } catch (_: Exception) {}
-                runCatching { client.close() }
+                try { relayWithBackoff(remote.inputStream, cout) } catch (_: Exception) {}
+                closeSocketWithLog(client, "client")
             }
             runBlocking { t1.join(); t2.cancelAndJoin() }
         } catch (e: Exception) { Log.d(TAG, "TCP relay error $destAddr: ${e.message}") }
@@ -731,12 +780,12 @@ class ProxyService : Service() {
 
     private fun directBridge(client: Socket, cin: DataInputStream, cout: OutputStream, remote: Socket) {
         val t1 = scope.launch(Dispatchers.IO) {
-            try { cin.copyTo(remote.outputStream, bufferSize = 64 * 1024) } catch (_: Exception) {}
-            runCatching { remote.close() }
+            try { relayWithBackoff(cin, remote.outputStream) } catch (_: Exception) {}
+            closeSocketWithLog(remote, "remote")
         }
         val t2 = scope.launch(Dispatchers.IO) {
-            try { remote.inputStream.copyTo(cout, bufferSize = 64 * 1024) } catch (_: Exception) {}
-            runCatching { client.close() }
+            try { relayWithBackoff(remote.inputStream, cout) } catch (_: Exception) {}
+            closeSocketWithLog(client, "client")
         }
         runBlocking { t1.join(); t2.cancelAndJoin() }
     }
